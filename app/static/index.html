@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Process Graph GPT + Canvas</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div>
+            <h1>Process Graph GPT</h1>
+            <p>Decision-Grade Process Structure Builder</p>
+          </div>
+        </div>
+        <div class="topbar-actions" aria-label="Graph actions">
+          <button class="button secondary" id="resetGraphButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5v6h6M20 19v-6h-6" /><path d="M5.6 9A7.5 7.5 0 0 1 18 7.1M18.4 15A7.5 7.5 0 0 1 6 16.9" /></svg>
+            Reset
+          </button>
+          <button class="button secondary" id="copyJsonButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1" /></svg>
+            Copy JSON
+          </button>
+          <button class="button secondary" id="exportJsonButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+            Export JSON
+          </button>
+          <button class="button primary" id="exportMarkdownButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+            Export Markdown
+          </button>
+        </div>
+      </header>
+
+      <main class="workspace" id="workspace">
+        <aside class="panel chat-panel" id="leftPanel" aria-label="Mutation compiler">
+          <div class="panel-header">
+            <div>
+              <h2>Mutation Compiler</h2>
+              <p>Chat to graph commands</p>
+            </div>
+            <div class="tab-row" role="tablist" aria-label="Compiler views">
+              <button class="tab is-active" type="button" data-tab="chat">Chat</button>
+              <button class="tab" type="button" data-tab="log">Log</button>
+              <button class="tab" type="button" data-tab="prompt">Prompt</button>
+            </div>
+            <button class="icon-button panel-toggle" id="toggleLeftPanelButton" type="button" title="Collapse left panel" aria-label="Collapse left menu" aria-expanded="true">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 6-6 6 6 6" /></svg>
+            </button>
+          </div>
+
+          <section class="tab-panel is-active" id="chatTab">
+            <div class="chat-scroll" id="chatScroll" aria-live="polite"></div>
+            <div class="instruction-box">
+              <label class="field">
+                <span>User instruction</span>
+                <textarea id="chatInput" rows="7">Add source Supplier invoice then Match invoice then decision Is variance found then Resolve variance then sink Posted</textarea>
+              </label>
+              <button class="icon-button send-instruction" id="sendInstructionButton" type="button" title="Send instruction">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2 11 13" /><path d="m22 2-7 20-4-9-9-4Z" /></svg>
+              </button>
+            </div>
+            <div class="button-row compiler-actions">
+              <button class="button primary" id="planMutationsButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v4H4z" /><path d="M4 14h7v6H4z" /><path d="M17 13v7" /><path d="M13.5 16.5h7" /></svg>
+                Plan Mutations
+              </button>
+              <button class="button secondary" id="applyPlanButton" type="button" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6" /></svg>
+                Apply Plan
+              </button>
+              <button class="button secondary" id="discardPlanButton" type="button" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+                Discard
+              </button>
+              <button class="button secondary" id="undoButton" type="button" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 14 4 9l5-5" /><path d="M4 9h10a6 6 0 0 1 0 12h-3" /></svg>
+                Undo
+              </button>
+            </div>
+            <div class="compiler-output">
+              <div class="output-heading">
+                <h3>Planned JSON</h3>
+                <span id="planStatus">No pending plan</span>
+              </div>
+              <pre id="planPreview">{}</pre>
+            </div>
+          </section>
+
+          <section class="tab-panel" id="logTab">
+            <div class="mutation-log" id="mutationLog"></div>
+          </section>
+
+          <section class="tab-panel" id="promptTab">
+            <div class="prompt-card">
+              <h3>Compiler System Prompt</h3>
+              <pre id="promptTemplate"></pre>
+            </div>
+          </section>
+
+          <details class="modeling-style-section">
+            <summary>Modeling style</summary>
+            <div class="style-options" id="modelingStyleOptions"></div>
+          </details>
+        </aside>
+
+        <section class="canvas-region" aria-label="Canvas">
+          <div class="canvas-toolbar">
+            <div>
+              <h2>Canvas</h2>
+              <p id="graphSubtitle">Graph model is the source of truth</p>
+            </div>
+            <div class="canvas-controls" aria-label="Canvas view controls">
+              <button class="icon-button" type="button" id="zoomOutButton" title="Zoom out">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14" /></svg>
+              </button>
+              <span id="zoomLevelLabel">100%</span>
+              <button class="icon-button" type="button" id="zoomInButton" title="Zoom in">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+              </button>
+              <button class="tool compact" type="button" id="fitCanvasButton" title="Fit graph to view">
+                <span aria-hidden="true"></span> Fit
+              </button>
+              <button class="tool compact" type="button" id="resetViewButton" title="Reset zoom and pan">
+                <span aria-hidden="true"></span> 1:1
+              </button>
+            </div>
+            <div class="tool-palette" aria-label="Create nodes">
+              <button class="tool layout" type="button" id="autoLayoutButton" title="Layout graph">
+                <span aria-hidden="true"></span> Layout
+              </button>
+              <button class="tool source" type="button" data-add-node="source" title="Add source">
+                <span aria-hidden="true"></span> Source
+              </button>
+              <button class="tool task" type="button" data-add-node="task" title="Add task">
+                <span aria-hidden="true"></span> Task
+              </button>
+              <button class="tool decision" type="button" data-add-node="decision" title="Add decision">
+                <span aria-hidden="true"></span> Decision
+              </button>
+              <button class="tool sink" type="button" data-add-node="sink" title="Add sink">
+                <span aria-hidden="true"></span> Sink
+              </button>
+            </div>
+          </div>
+          <div class="canvas-frame">
+            <svg id="graphCanvas" role="img" aria-label="Editable process graph canvas"></svg>
+            <div class="notation-legend" id="notationLegend" aria-live="polite"></div>
+            <div class="canvas-minimap" id="canvasMinimap" aria-label="Canvas minimap"></div>
+          </div>
+          <div class="statusbar">
+            <span id="nodeCount">0 nodes</span>
+            <span id="edgeCount">0 edges</span>
+            <span id="selectedStatus">Nothing selected</span>
+          </div>
+        </section>
+
+        <aside class="panel inspector-panel" id="rightPanel" aria-label="Inspector">
+          <div class="panel-header compact">
+            <div class="inspector-tabbar tab-row" role="tablist" aria-label="Inspector views">
+              <button class="tab is-active" type="button" data-inspector-tab="inspect">Inspect</button>
+              <button class="tab" type="button" data-inspector-tab="ontology">Ontology</button>
+              <button class="icon-button panel-toggle inspector-inline-toggle" id="toggleRightPanelButton" type="button" title="Collapse right panel" aria-label="Collapse right inspector" aria-expanded="true">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>
+              </button>
+            </div>
+            <span hidden id="inspectorSubhead">Selected graph object</span>
+          </div>
+
+          <div class="inspector-view is-active" id="inspectView">
+            <section class="inspector-section" id="inspectorContent"></section>
+
+            <section class="inspector-section edge-builder">
+              <div class="section-title">
+                <h3>Add Edge</h3>
+                <button class="icon-button" id="toggleAddEdgeButton" type="button" title="Show add edge form">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+                </button>
+              </div>
+              <div id="edgeBuilderBody">
+              <div class="field-grid">
+                <label class="field">
+                  <span>From</span>
+                  <select id="edgeFromSelect"></select>
+                </label>
+                <label class="field">
+                  <span>To</span>
+                  <select id="edgeToSelect"></select>
+                </label>
+                <label class="field">
+                  <span>Type</span>
+                  <select id="edgeTypeSelect"></select>
+                </label>
+                <label class="field">
+                  <span>Condition</span>
+                  <input id="edgeConditionInput" type="text" placeholder="Optional" />
+                </label>
+                <label class="field">
+                  <span>Flow Name</span>
+                  <input id="edgeFlowNameInput" type="text" placeholder="Optional" />
+                </label>
+                <label class="field">
+                  <span>Flow Kind</span>
+                  <select id="edgeFlowKindSelect"></select>
+                </label>
+              </div>
+              <div class="type-help" id="edgeTypeHelp"></div>
+              <div class="type-help" id="edgeFlowKindHelp"></div>
+              <button class="button secondary full" id="addEdgeButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14" /><path d="m13 6 6 6-6 6" /></svg>
+                Add Edge
+              </button>
+              </div>
+            </section>
+
+            <section class="inspector-section">
+              <div class="section-title">
+                <button class="section-toggle" id="toggleResourcesButton" type="button">
+                  <span>Resources</span>
+                  <small id="resourceCount">0</small>
+                </button>
+                <button class="icon-button" id="addResourceButton" type="button" title="Add resource">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+                </button>
+              </div>
+              <div class="resource-list" id="resourceList"></div>
+            </section>
+
+            <section class="inspector-section">
+              <div class="section-title">
+                <button class="section-toggle" id="toggleConstraintsButton" type="button">
+                  <span>Constraints</span>
+                  <small id="constraintCount">0</small>
+                </button>
+                <button class="icon-button" id="addConstraintButton" type="button" title="Add constraint">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+                </button>
+              </div>
+              <div class="constraint-list" id="constraintList"></div>
+            </section>
+
+            <section class="inspector-section validation-section">
+              <div class="section-title">
+                <h3>Validation</h3>
+                <span id="readinessBadge">Checking</span>
+              </div>
+              <label class="checkbox-field">
+                <input type="checkbox" id="allowCyclesInput" />
+                <span>Allow rework cycles</span>
+              </label>
+              <div class="validation-list" id="validationList"></div>
+            </section>
+          </div>
+
+          <div class="inspector-view" id="ontologyView">
+            <section class="inspector-section">
+              <label class="field">
+                <span>Search ontology</span>
+                <input id="ontologySearchInput" type="search" placeholder="Find type, property, edge, resource..." />
+              </label>
+              <button class="button secondary full" id="inferOntologyButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16" /><path d="m14 6 6 6-6 6" /><path d="M4 6h5" /><path d="M4 18h5" /></svg>
+                Infer From Graph
+              </button>
+            </section>
+            <section class="inspector-section ontology-content" id="ontologyContent"></section>
+          </div>
+        </aside>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="./app.js" defer></script>
+  </body>
+</html>

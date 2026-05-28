@@ -1,0 +1,255 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/process-graph.schema.json",
+  "title": "ProcessGraph",
+  "type": "object",
+  "required": [
+    "id",
+    "name",
+    "version",
+    "description",
+    "modeling_style",
+    "nodes",
+    "edges",
+    "resources",
+    "constraints",
+    "assumptions",
+    "ontology",
+    "metadata"
+  ],
+  "properties": {
+    "id": { "type": "string" },
+    "name": { "type": "string" },
+    "version": { "type": "string" },
+    "description": { "type": "string" },
+    "modeling_style": {
+      "enum": ["none", "business_process", "value_stream", "system_flow", "team_topology", "custom"]
+    },
+    "nodes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/node" }
+    },
+    "edges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/edge" }
+    },
+    "resources": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/resource" }
+    },
+    "constraints": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/constraint" }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/assumption" }
+    },
+    "open_questions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "chat_messages": {
+      "type": "array",
+      "items": { "type": "object", "additionalProperties": true }
+    },
+    "versions": {
+      "type": "array",
+      "items": { "type": "object", "additionalProperties": true }
+    },
+    "ontology": { "$ref": "#/$defs/ontology" },
+    "metadata": {
+      "type": "object",
+      "required": ["created_by", "created_at", "tags"],
+      "properties": {
+        "created_by": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "node": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "type",
+        "inputs",
+        "outputs",
+        "resources_required",
+        "attributes",
+        "notes"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "type": { "enum": ["source", "sink", "task", "decision"] },
+        "description": { "type": "string" },
+        "description_status": { "enum": ["empty", "suggested", "custom", "approved"] },
+        "inputs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "outputs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "resources_required": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "quantity"],
+            "properties": {
+              "resource_id": { "type": "string" },
+              "name": { "type": "string" },
+              "quantity": { "type": "string" }
+            },
+            "additionalProperties": true
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "properties": {
+            "duration": {},
+            "capacity": {},
+            "cost": {}
+          },
+          "additionalProperties": true
+        },
+        "notes": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "edge": {
+      "type": "object",
+      "required": ["id", "from_node", "to_node", "type", "condition", "flows"],
+      "properties": {
+        "id": { "type": "string" },
+        "from_node": { "type": "string" },
+        "to_node": { "type": "string" },
+        "type": { "enum": ["flow", "dependency", "trigger", "feedback", "allocation", "custom"] },
+        "condition": { "type": "string" },
+        "flows": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/flow" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "flow": {
+      "type": "object",
+      "required": ["id", "name", "kind", "quantity", "unit", "properties"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "kind": { "enum": ["parts", "cash", "energy", "information", "data", "work", "approval", "custom"] },
+        "quantity": { "type": "string" },
+        "unit": { "type": "string" },
+        "properties": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "resource": {
+      "type": "object",
+      "required": ["id", "name", "type", "attributes"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "type": { "enum": ["human", "machine", "material"] },
+        "attributes": {
+          "type": "object",
+          "properties": {
+            "capacity": {},
+            "cost_rate": {}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "constraint": {
+      "type": "object",
+      "required": ["id", "type", "expression"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "enum": ["flow_balance", "capability_limit", "timing", "routing_rule", "policy_rule"] },
+        "fields": {
+          "type": "object",
+          "properties": {
+            "target": { "type": "string" },
+            "metric": { "type": "string" },
+            "operator": { "type": "string" },
+            "value": { "type": "string" },
+            "unit": { "type": "string" },
+            "notes": { "type": "string" }
+          },
+          "additionalProperties": true
+        },
+        "expression": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "assumption": {
+      "type": "object",
+      "required": ["id", "text"],
+      "properties": {
+        "id": { "type": "string" },
+        "text": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "ontologyEntry": {
+      "type": "object",
+      "required": ["label", "description"],
+      "properties": {
+        "label": { "type": "string" },
+        "description": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "ontology": {
+      "type": "object",
+      "required": ["modeling_styles", "node_types", "edge_types", "flow_types", "constraint_types", "resource_types", "properties"],
+      "properties": {
+        "modeling_styles": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ontologyEntry" }
+        },
+        "node_types": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ontologyEntry" }
+        },
+        "edge_types": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ontologyEntry" }
+        },
+        "flow_types": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ontologyEntry" }
+        },
+        "constraint_types": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ontologyEntry" }
+        },
+        "resource_types": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ontologyEntry" }
+        },
+        "properties": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ontologyEntry" }
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

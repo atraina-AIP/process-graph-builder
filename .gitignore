@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+
+# Local graph data (not committed — persisted via volume or database)
+data/
+
+# OS
+.DS_Store
+Thumbs.db
