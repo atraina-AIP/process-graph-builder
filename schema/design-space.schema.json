@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/design-space.schema.json",
+  "title": "DesignSpace",
+  "description": "Optional design-space layer over a ProcessGraph. It is additive and snake_case. Two parts: (1) element-level annotations on existing nodes/edges/flows (quantitative parameters with uncertainty + optional decision domains, node variants, flow economics, edge change-moves); (2) a top-level `design_space` object that flattens the declared variables, objectives, and budgets into one artifact an LLM converts into a search/optimization tool. It does not need to be directly solver-parseable; it is structured so that conversion is easy. Searching the space and scoring candidates are done by the external tool, not here.",
+
+  "type": "object",
+  "properties": {
+    "design_space": { "$ref": "#/$defs/design_space" }
+  },
+  "additionalProperties": true,
+
+  "$defs": {
+    "quantity": {
+      "description": "A loose numeric value with a unit. `value` may be null while still being mapped.",
+      "type": "object",
+      "required": ["value"],
+      "properties": {
+        "value": { "type": ["number", "string", "null"] },
+        "unit": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "uncertainty": {
+      "description": "Per-quantitative-parameter uncertainty (a value we do not control or do not know exactly). Distinct from `variable_domain` (a value we choose). A parameter may carry both.",
+      "type": "object",
+      "properties": {
+        "kind": { "enum": ["range", "plus_minus", "confidence", "distribution"] },
+        "low": { "type": ["number", "null"] },
+        "high": { "type": ["number", "null"] },
+        "plus_minus": { "type": ["number", "null"] },
+        "percent": { "type": "boolean", "description": "true if plus_minus is a percentage" },
+        "confidence": { "enum": ["low", "medium", "high"] },
+        "distribution": { "type": "string", "examples": ["normal", "uniform", "triangular"] },
+        "params": { "type": "object", "additionalProperties": true },
+        "notes": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "variable_domain": {
+      "description": "The set of values the external search may choose for a decision variable.",
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["range", "enum", "boolean", "set"] },
+        "min": { "type": ["number", "null"] },
+        "max": { "type": ["number", "null"] },
+        "step": { "type": ["number", "null"] },
+        "unit": { "type": "string" },
+        "options": { "type": "array", "items": { "type": ["string", "number", "boolean"] } },
+        "notes": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "quantitative_parameter": {
+      "description": "A property/attribute value promoted from a plain string to a structured number. A node/edge `attributes`/`properties` value may be EITHER a plain string (free-text, default) OR this object.",
+      "type": "object",
+      "required": ["value"],
+      "properties": {
+        "value": { "type": ["number", "string", "null"] },
+        "unit": { "type": "string" },
+        "uncertainty": { "$ref": "#/$defs/uncertainty" },
+        "variable": { "$ref": "#/$defs/variable_domain" },
+        "notes": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "property_value": {
+      "description": "What a node `attributes` value or edge `properties` value may be once the design-space layer is adopted: a plain string (as today) or a quantitative_parameter.",
+      "oneOf": [
+        { "type": "string" },
+        { "$ref": "#/$defs/quantitative_parameter" }
+      ]
+    },
+
+    "node_variant_fields": {
+      "description": "Optional fields a NODE may carry to model an investment alternative. A variant is a separate node whose differing values live in its own attributes; adopting it carries a one-off cost/time.",
+      "type": "object",
+      "properties": {
+        "variant_of": { "type": "string", "description": "id of the base node this is a variant of" },
+        "adoption": {
+          "type": "object",
+          "properties": {
+            "cost": { "$ref": "#/$defs/quantity" },
+            "time": { "$ref": "#/$defs/quantity" },
+            "notes": { "type": "string" }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "flow_economics": {
+      "description": "Optional economics a FLOW (inside an edge's flows[]) may carry so the external search can assess profitability and keep-vs-eliminate.",
+      "type": "object",
+      "properties": {
+        "value": { "$ref": "#/$defs/quantitative_parameter" },
+        "cost": { "$ref": "#/$defs/quantitative_parameter" },
+        "notes": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "edge_change": {
+      "description": "Optional `change` object on an EDGE describing the design moves available on it and their change cost/time.",
+      "type": "object",
+      "properties": {
+        "reroutable": { "type": "boolean" },
+        "eliminable": { "type": "boolean" },
+        "cost": { "$ref": "#/$defs/quantity" },
+        "time": { "$ref": "#/$defs/quantity" },
+        "notes": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "objective": {
+      "description": "A dimension the external search optimizes or must satisfy.",
+      "type": "object",
+      "required": ["metric"],
+      "properties": {
+        "metric": { "type": "string", "examples": ["margin_gain", "feasibility", "uncertainty", "throughput", "change_cost", "change_time"] },
+        "direction": { "enum": ["max", "min"] },
+        "kind": { "enum": ["objective", "hard_constraint", "soft_constraint"] },
+        "notes": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "budget": {
+      "description": "A limit the search must respect (e.g. total change cost or time).",
+      "type": "object",
+      "required": ["metric"],
+      "properties": {
+        "metric": { "type": "string", "examples": ["change_cost", "change_time"] },
+        "limit": { "$ref": "#/$defs/quantity" },
+        "notes": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "variable_ref": {
+      "description": "One entry in design_space.variables — a flattened pointer to where variability lives, so the LLM has a single list of the move set. One of: a parameter range, a node-variant choice, or a flow move.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "target"],
+          "properties": {
+            "kind": { "const": "parameter" },
+            "target": { "type": "string", "description": "<element_id>.<property_key>" },
+            "domain": { "$ref": "#/$defs/variable_domain" },
+            "uncertainty": { "$ref": "#/$defs/uncertainty" },
+            "notes": { "type": "string" }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["kind", "base"],
+          "properties": {
+            "kind": { "const": "node_variant" },
+            "base": { "type": "string", "description": "base node id" },
+            "options": { "type": "array", "items": { "type": "string" }, "description": "node ids (base + its variants) the search chooses among" },
+            "adoption": { "type": "object", "additionalProperties": true },
+            "notes": { "type": "string" }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["kind", "target"],
+          "properties": {
+            "kind": { "const": "flow_move" },
+            "target": { "type": "string", "description": "edge id" },
+            "moves": { "type": "array", "items": { "enum": ["reroute", "eliminate", "add"] } },
+            "change": { "$ref": "#/$defs/edge_change" },
+            "notes": { "type": "string" }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+
+    "design_space": {
+      "description": "The exported handoff artifact. Flattens the in-graph annotations into one place: the decision variables/moves, the objectives, and the budgets. An LLM converts this (plus the graph) into the actual search tool.",
+      "type": "object",
+      "required": ["variables"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "base_graph_id": { "type": "string", "description": "the as-is graph this space explores around" },
+        "variables": { "type": "array", "items": { "$ref": "#/$defs/variable_ref" } },
+        "objectives": { "type": "array", "items": { "$ref": "#/$defs/objective" } },
+        "budgets": { "type": "array", "items": { "$ref": "#/$defs/budget" } },
+        "notes": { "type": "string", "description": "free text guidance for the LLM->tool conversion" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

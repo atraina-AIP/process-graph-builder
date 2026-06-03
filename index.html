@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Process Graph GPT + Canvas</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./styles.css?v=20260603k" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div>
+            <h1>Process Graph GPT</h1>
+            <p>Decision-Grade Process Structure Builder</p>
+          </div>
+        </div>
+        <div class="topbar-actions" aria-label="Graph actions">
+          <button class="button secondary" id="resetGraphButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5v6h6M20 19v-6h-6" /><path d="M5.6 9A7.5 7.5 0 0 1 18 7.1M18.4 15A7.5 7.5 0 0 1 6 16.9" /></svg>
+            Reset
+          </button>
+          <button class="button secondary" id="clearGraphButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18" /><path d="M8 6V4h8v2" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6M14 11v6" /></svg>
+            Clear
+          </button>
+          <input id="importFileInput" type="file" accept="application/json,.json" hidden />
+          <button class="button secondary" id="openSaveButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" /><path d="M17 21v-8H7v8" /><path d="M7 3v5h8" /></svg>
+            Save
+          </button>
+          <button class="button primary" id="openLoadButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" /></svg>
+            Load
+          </button>
+          <span class="topbar-divider" aria-hidden="true"></span>
+          <button class="button secondary" id="openOntologyButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16" /><path d="m14 6 6 6-6 6" /><path d="M4 6h5" /><path d="M4 18h5" /></svg>
+            Ontology
+          </button>
+          <button class="button secondary" id="openValidationButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 11 3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg>
+            Validation
+            <span class="validation-status-dot" id="validationStatusDot" aria-hidden="true"></span>
+          </button>
+          <button class="button secondary" id="openDesignSpaceButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5" /><circle cx="18" cy="18" r="2.5" /><path d="M8.5 6H15a3 3 0 0 1 3 3v6" /><path d="M6 8.5V15" /></svg>
+            Design space
+          </button>
+        </div>
+      </header>
+
+      <main class="workspace" id="workspace">
+        <aside class="panel chat-panel" id="leftPanel" aria-label="Mutation compiler">
+          <div class="panel-header">
+            <div>
+              <h2>Mutation Compiler</h2>
+              <p>Chat to graph commands</p>
+            </div>
+            <div class="tab-row" role="tablist" aria-label="Compiler views">
+              <button class="tab is-active" type="button" data-tab="chat">Chat</button>
+              <button class="tab" type="button" data-tab="log">Log</button>
+              <button class="tab" type="button" data-tab="prompt">Prompt</button>
+            </div>
+            <button class="icon-button panel-toggle" id="toggleLeftPanelButton" type="button" title="Collapse left panel" aria-label="Collapse left menu" aria-expanded="true">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 6-6 6 6 6" /></svg>
+            </button>
+          </div>
+
+          <section class="tab-panel is-active" id="chatTab">
+            <div class="chat-scroll" id="chatScroll" aria-live="polite"></div>
+            <div class="instruction-box">
+              <label class="field">
+                <span>User instruction</span>
+                <textarea id="chatInput" rows="7">Add source Supplier invoice then Match invoice then decision Is variance found then Resolve variance then sink Posted</textarea>
+              </label>
+              <button class="icon-button send-instruction" id="sendInstructionButton" type="button" title="Send instruction">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2 11 13" /><path d="m22 2-7 20-4-9-9-4Z" /></svg>
+              </button>
+            </div>
+            <div class="button-row compiler-actions">
+              <button class="button primary" id="planMutationsButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v4H4z" /><path d="M4 14h7v6H4z" /><path d="M17 13v7" /><path d="M13.5 16.5h7" /></svg>
+                Plan Mutations
+              </button>
+              <button class="button secondary" id="applyPlanButton" type="button" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6" /></svg>
+                Apply Plan
+              </button>
+              <button class="button secondary" id="discardPlanButton" type="button" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+                Discard
+              </button>
+              <button class="button secondary" id="undoButton" type="button" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 14 4 9l5-5" /><path d="M4 9h10a6 6 0 0 1 0 12h-3" /></svg>
+                Undo
+              </button>
+            </div>
+            <div class="compiler-output">
+              <div class="output-heading">
+                <h3>Planned JSON</h3>
+                <span id="planStatus">No pending plan</span>
+              </div>
+              <pre id="planPreview">{}</pre>
+            </div>
+          </section>
+
+          <section class="tab-panel" id="logTab">
+            <div class="mutation-log" id="mutationLog"></div>
+          </section>
+
+          <section class="tab-panel" id="promptTab">
+            <div class="prompt-card">
+              <h3>Compiler System Prompt</h3>
+              <pre id="promptTemplate"></pre>
+            </div>
+          </section>
+
+          <details class="modeling-style-section">
+            <summary>Modeling style</summary>
+            <div class="style-options" id="modelingStyleOptions"></div>
+          </details>
+        </aside>
+
+        <section class="canvas-region" aria-label="Canvas">
+          <div class="canvas-toolbar">
+            <div>
+              <h2>Canvas</h2>
+              <p id="graphSubtitle">Graph model is the source of truth</p>
+            </div>
+            <div class="canvas-controls" aria-label="Canvas view controls">
+              <button class="icon-button" type="button" id="zoomOutButton" title="Zoom out">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14" /></svg>
+              </button>
+              <span id="zoomLevelLabel">100%</span>
+              <button class="icon-button" type="button" id="zoomInButton" title="Zoom in">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+              </button>
+              <button class="tool compact" type="button" id="fitCanvasButton" title="Fit graph to view">
+                <span aria-hidden="true"></span> Fit
+              </button>
+              <button class="tool compact" type="button" id="resetViewButton" title="Reset zoom and pan">
+                <span aria-hidden="true"></span> 1:1
+              </button>
+              <button class="tool compact" type="button" id="viewsButton" title="Views and filters" aria-haspopup="true" aria-expanded="false">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18l-7 8v6l-4-2v-4z" /></svg> Views
+              </button>
+            </div>
+            <div class="tool-palette" aria-label="Create nodes">
+              <button class="tool layout" type="button" id="autoLayoutButton" title="Layout graph">
+                <span aria-hidden="true"></span> Layout
+              </button>
+              <select class="tool-select" id="addNodeSelect" aria-label="Add a node to the canvas" title="Add a node">
+                <option value="" selected>+ Add node</option>
+                <option value="source">Source</option>
+                <option value="task">Task</option>
+                <option value="decision">Decision</option>
+                <option value="sink">Sink</option>
+                <option value="resource">Resource</option>
+              </select>
+            </div>
+          </div>
+          <div class="canvas-frame">
+            <svg id="graphCanvas" role="img" aria-label="Editable process graph canvas"></svg>
+            <div class="notation-legend" id="notationLegend" aria-live="polite"></div>
+            <div class="canvas-minimap" id="canvasMinimap" aria-label="Canvas minimap"></div>
+            <div class="views-popover" id="viewsPopover" aria-label="Views and filters" hidden>
+              <div class="views-popover-header">
+                <strong>Views &amp; filters</strong>
+                <button class="icon-button" id="viewsCloseButton" type="button" title="Close" aria-label="Close views">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+                </button>
+              </div>
+              <p class="views-hint">Dims everything outside the view. The graph is never changed.</p>
+              <div class="views-section">
+                <span class="views-label">Flow kinds</span>
+                <div class="views-chips" id="viewFlowKindChips"></div>
+              </div>
+              <div class="views-section">
+                <span class="views-label">Edge types</span>
+                <div class="views-chips" id="viewEdgeTypeChips"></div>
+              </div>
+              <div class="views-section">
+                <span class="views-label">Node types</span>
+                <div class="views-chips" id="viewNodeTypeChips"></div>
+              </div>
+              <label class="checkbox-field">
+                <input type="checkbox" id="viewFocusSelection" />
+                <span>Focus on selection (1 hop)</span>
+              </label>
+              <button class="button secondary full" id="viewClearButton" type="button">Show full graph</button>
+              <div class="views-section saved-views">
+                <span class="views-label">Saved views</span>
+                <div class="saved-views-list" id="savedViewsList"></div>
+                <div class="saved-views-save">
+                  <input type="text" id="savedViewNameInput" placeholder="View name" aria-label="Saved view name" />
+                  <button class="button secondary" id="saveViewButton" type="button">Save current view</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="statusbar">
+            <span id="nodeCount">0 nodes</span>
+            <span id="edgeCount">0 edges</span>
+            <span id="selectedStatus">Nothing selected</span>
+            <span class="view-status" id="viewStatus" hidden></span>
+          </div>
+        </section>
+
+      </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <dialog class="library-dialog" id="libraryDialog" aria-label="Open or import a graph">
+      <div class="library-header">
+        <h2>Open / Import</h2>
+        <button class="icon-button" id="closeLibraryButton" type="button" title="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+        </button>
+      </div>
+      <div class="library-save-row">
+        <button class="button primary full" id="openFilePickerButton" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" /></svg>
+          Open JSON file
+        </button>
+        <button class="button secondary full" id="importFromFileButton" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V3" /><path d="m7 8 5-5 5 5" /><path d="M5 21h14" /></svg>
+          Import JSON file
+        </button>
+      </div>
+      <div class="library-list" id="libraryList"></div>
+    </dialog>
+
+    <dialog class="library-dialog" id="saveDialog" aria-label="Save graph">
+      <div class="library-header">
+        <h2>Save</h2>
+        <button class="icon-button" id="closeSaveButton" type="button" title="Close" aria-label="Close save">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+        </button>
+      </div>
+      <div class="save-dialog-body">
+        <label class="field">
+          <span>Graph name</span>
+          <input id="saveGraphName" type="text" placeholder="Graph name" aria-label="Graph name" />
+        </label>
+        <button class="button primary full" id="saveToLibraryButton" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" /><path d="M17 21v-8H7v8" /><path d="M7 3v5h8" /></svg>
+          Save to Library
+        </button>
+        <div class="file-save-status" id="fileSaveStatus">No opened file</div>
+        <button class="button primary full" id="saveToOpenedFileButton" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" /><path d="M17 21v-8H7v8" /><path d="M7 3v5h8" /></svg>
+          Save to opened file
+        </button>
+        <button class="button secondary full" id="saveAsFileButton" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+          Save as JSON file
+        </button>
+        <button class="button secondary full" id="saveExportJsonButton" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+          Export JSON
+        </button>
+        <button class="button secondary full" id="saveExportMarkdownButton" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+          Export Markdown
+        </button>
+        <button class="button secondary full" id="saveExportDesignSpaceButton" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5" /><circle cx="18" cy="18" r="2.5" /><path d="M8.5 6H15a3 3 0 0 1 3 3v6" /><path d="M6 8.5V15" /></svg>
+          Export design space
+        </button>
+        <button class="button secondary full" id="saveCopyJsonButton" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1" /></svg>
+          Copy JSON
+        </button>
+      </div>
+    </dialog>
+
+    <dialog class="element-editor-dialog" id="elementEditorDialog" aria-label="Element editor">
+      <div class="element-editor-header">
+        <h2 id="elementEditorTitle">Edit element</h2>
+        <div class="element-editor-tabs tab-row" role="tablist" aria-label="Editor views">
+          <button class="tab is-active" type="button" data-editor-tab="details">Details</button>
+          <button class="tab" type="button" data-editor-tab="constraints">Constraints</button>
+        </div>
+        <button class="icon-button" id="closeElementEditorButton" type="button" title="Close" aria-label="Close element editor">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+        </button>
+      </div>
+      <div class="element-editor-body">
+        <div class="editor-tab-panel is-active" id="editorDetailsPanel">
+          <section class="inspector-section" id="inspectorContent"></section>
+        </div>
+        <div class="editor-tab-panel" id="editorConstraintsPanel">
+          <section class="inspector-section" id="elementConstraints"></section>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog class="library-dialog app-dialog" id="ontologyDialog" aria-label="Ontology">
+      <div class="library-header">
+        <h2>Ontology</h2>
+        <button class="icon-button" id="closeOntologyButton" type="button" title="Close" aria-label="Close ontology">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+        </button>
+      </div>
+      <div class="app-dialog-body">
+        <section class="inspector-section">
+          <label class="field">
+            <span>Search ontology</span>
+            <input id="ontologySearchInput" type="search" placeholder="Find type, property, edge, resource..." />
+          </label>
+          <button class="button secondary full" id="inferOntologyButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16" /><path d="m14 6 6 6-6 6" /><path d="M4 6h5" /><path d="M4 18h5" /></svg>
+            Infer From Graph
+          </button>
+        </section>
+        <section class="inspector-section ontology-content" id="ontologyContent"></section>
+      </div>
+    </dialog>
+
+
+    <dialog class="library-dialog app-dialog" id="validationDialog" aria-label="Validation">
+      <div class="library-header">
+        <div class="validation-dialog-title">
+          <h2>Validation</h2>
+          <span id="readinessBadge">Checking</span>
+        </div>
+        <button class="icon-button" id="closeValidationButton" type="button" title="Close" aria-label="Close validation">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+        </button>
+      </div>
+      <div class="app-dialog-body">
+        <section class="inspector-section validation-section">
+          <label class="checkbox-field">
+            <input type="checkbox" id="allowCyclesInput" />
+            <span>Allow rework cycles</span>
+          </label>
+          <label class="checkbox-field">
+            <input type="checkbox" id="validateViewInput" />
+            <span>Validate current view only</span>
+          </label>
+          <div class="validation-scope-note" id="validationScopeNote" hidden></div>
+          <div class="validation-list" id="validationList"></div>
+        </section>
+      </div>
+    </dialog>
+
+    <dialog class="library-dialog app-dialog" id="designSpaceDialog" aria-label="Design space">
+      <div class="library-header">
+        <h2>Design space</h2>
+        <button class="icon-button" id="closeDesignSpaceButton" type="button" title="Close" aria-label="Close design space">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+        </button>
+      </div>
+      <div class="app-dialog-body">
+        <section class="inspector-section design-space-section">
+          <h3>Decision variables</h3>
+          <p class="type-help">Derived from element annotations (read-only). Mark a property variable, add a node variant, or flag an edge reroutable/eliminable to populate this.</p>
+          <div class="design-space-variables" id="designSpaceVariables"></div>
+        </section>
+        <section class="inspector-section design-space-section">
+          <h3>Objectives</h3>
+          <p class="type-help">What the external search optimizes or must satisfy. Metric is free text; examples: margin_gain, feasibility, uncertainty, throughput, change_cost, change_time.</p>
+          <div class="design-space-objectives" id="designSpaceObjectives"></div>
+        </section>
+        <section class="inspector-section design-space-section">
+          <h3>Budgets</h3>
+          <p class="type-help">Limits the search must respect (e.g. total change_cost or change_time).</p>
+          <div class="design-space-budgets" id="designSpaceBudgets"></div>
+        </section>
+        <section class="inspector-section design-space-section">
+          <h3>Notes</h3>
+          <label class="field">
+            <span>Guidance for the LLM &rarr; tool conversion</span>
+            <textarea id="designSpaceNotes" rows="4" placeholder="Free-text guidance: what to explore, trade-offs, and the intent behind the move set."></textarea>
+          </label>
+        </section>
+      </div>
+    </dialog>
+
+    <script src="./app.js?v=20260603l" defer></script>
+  </body>
+</html>
