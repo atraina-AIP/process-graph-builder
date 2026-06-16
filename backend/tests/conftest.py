@@ -7,26 +7,38 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-os.environ["PROCESS_GRAPH_STORE"] = str(Path(tempfile.mkdtemp()) / "graphs.json")
+TEST_DATA_DIR = ROOT / ".test-data"
+TEST_DATA_DIR.mkdir(exist_ok=True)
+os.environ["PROCESS_GRAPH_STORE"] = str(TEST_DATA_DIR / "graphs-test.json")
 
 import pytest  # noqa: E402
 
 from backend import main as main_module  # noqa: E402
 
 
+@pytest.fixture
+def tmp_path(request):
+    """Repo-local tmp_path replacement for delete-restricted environments."""
+    safe_name = "".join(
+        char if char.isalnum() or char in "-_" else "_" for char in request.node.name
+    )
+    path = TEST_DATA_DIR / safe_name
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "graphs.json").write_text('{"tenants": {}}', encoding="utf-8")
+    return path
+
+
 @pytest.fixture(autouse=True)
 def clean_store():
     """Start every test from an empty store."""
     store = Path(main_module.STORE_PATH)
-    if store.exists():
-        store.unlink()
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text('{"tenants": {}}', encoding="utf-8")
     yield
-    if store.exists():
-        store.unlink()
+    store.write_text('{"tenants": {}}', encoding="utf-8")

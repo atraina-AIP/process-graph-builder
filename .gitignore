@@ -1,6 +1,11 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+pytest-tmp/
+pytest-cache-files-*/
+tmp-check/
+.test-data/
+*.tmp
 
 .venv/
 venv/
