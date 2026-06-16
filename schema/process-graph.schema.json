@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://example.local/process-graph.schema.json",
+  "$comment": "schema v5 — design-space annotations (variant_of/adoption on node, change on edge, value/cost on flow, top-level design_space); see design-space.schema.json. schema v4 (saved_views) — 2026-06-02: optional top-level `saved_views` array — persistent subgraph view definitions ({ id, name, filter }) that filter/focus the canonical graph without mutating it; each `filter` reuses the quick-filter shape (flow_kinds, edge_types, node_types, focus_selection, hops) and rides along in export. `active_view_id` stays session/UI state and is NOT part of this artifact. v4 base — 2026-06-02: resources are now first-class canvas nodes (node type \"resource\"; its kind/cost_rate/basis_unit live in node attributes) and \"X requires resource Y\" is an allocation edge from the consuming node to the resource node carrying the quantity. The top-level `resources` array and node/edge `resources_required` lists are now OPTIONAL/deprecated — tolerated for migration only, no longer produced or edited by the UI. v3 — 2026-06-02: optional top-level tenant_id stamped on every durable graph (Propel guardrail: no tenant-less production records; durable records are tenant-scoped). Constraint update (2026-06-02): constraints are now free-text — each constraint is a single hand-edited plain-language statement in `expression` (the source of truth); `type` is retained with a default but not shown in the UI; structured `fields` (target/scope/metric/operator/value/unit/notes) are optional and tolerated only for back-compat, no longer read or written by the editor. v2 — 2026-06-02: edge properties/perspectives/description/resources_required; node perspectives; cost resource type + basis_unit; descriptions on edges/resources/constraints; notes optional",
   "title": "ProcessGraph",
   "type": "object",
   "required": [
@@ -11,7 +12,6 @@
     "modeling_style",
     "nodes",
     "edges",
-    "resources",
     "constraints",
     "assumptions",
     "ontology",
@@ -19,6 +19,10 @@
   ],
   "properties": {
     "id": { "type": "string" },
+    "tenant_id": {
+      "type": "string",
+      "description": "Owning tenant for this durable graph. Stamped by the backend on every stored graph; reads/writes are scoped to it so cross-tenant access is not possible by default. Optional in the public schema for back-compat with offline/local-file envelopes that predate tenant scoping."
+    },
     "name": { "type": "string" },
     "version": { "type": "string" },
     "description": { "type": "string" },
@@ -40,6 +44,15 @@
     "constraints": {
       "type": "array",
       "items": { "$ref": "#/$defs/constraint" }
+    },
+    "saved_views": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/saved_view" }
+    },
+    "design_space": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "Optional design-space export artifact (decision variables, objectives, budgets). Kept permissive here; see design-space.schema.json (#/$defs/design_space) for the full shape."
     },
     "assumptions": {
       "type": "array",
@@ -82,14 +95,12 @@
         "type",
         "inputs",
         "outputs",
-        "resources_required",
-        "attributes",
-        "notes"
+        "attributes"
       ],
       "properties": {
         "id": { "type": "string" },
         "name": { "type": "string" },
-        "type": { "enum": ["source", "sink", "task", "decision"] },
+        "type": { "enum": ["source", "sink", "task", "decision", "resource"] },
         "description": { "type": "string" },
         "description_status": { "enum": ["empty", "suggested", "custom", "approved"] },
         "inputs": {
@@ -122,7 +133,29 @@
           },
           "additionalProperties": true
         },
+        "perspectives": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/perspective" }
+        },
+        "variant_of": {
+          "type": "string",
+          "$comment": "Optional design-space annotation: id of the base node this is an investment variant of. See design-space.schema.json (#/$defs/node_variant_fields)."
+        },
+        "adoption": {
+          "type": "object",
+          "additionalProperties": true,
+          "$comment": "Optional design-space annotation: one-off cost/time to adopt this variant. See design-space.schema.json (#/$defs/node_variant_fields)."
+        },
         "notes": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "perspective": {
+      "type": "object",
+      "required": ["label", "text"],
+      "properties": {
+        "label": { "type": "string" },
+        "text": { "type": "string" }
       },
       "additionalProperties": false
     },
@@ -138,6 +171,34 @@
         "flows": {
           "type": "array",
           "items": { "$ref": "#/$defs/flow" }
+        },
+        "resources_required": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "quantity"],
+            "properties": {
+              "resource_id": { "type": "string" },
+              "name": { "type": "string" },
+              "quantity": { "type": "string" }
+            },
+            "additionalProperties": true
+          }
+        },
+        "properties": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "perspectives": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/perspective" }
+        },
+        "description": { "type": "string" },
+        "description_status": { "enum": ["empty", "suggested", "custom", "approved"] },
+        "change": {
+          "type": "object",
+          "additionalProperties": true,
+          "$comment": "Optional design-space annotation: change-moves available on this edge (reroutable/eliminable) with change cost/time. See design-space.schema.json (#/$defs/edge_change)."
         }
       },
       "additionalProperties": false
@@ -154,6 +215,16 @@
         "properties": {
           "type": "object",
           "additionalProperties": true
+        },
+        "value": {
+          "type": "object",
+          "additionalProperties": true,
+          "$comment": "Optional design-space annotation: flow economics — value as a quantitative parameter. See design-space.schema.json (#/$defs/flow_economics)."
+        },
+        "cost": {
+          "type": "object",
+          "additionalProperties": true,
+          "$comment": "Optional design-space annotation: flow economics — cost as a quantitative parameter. See design-space.schema.json (#/$defs/flow_economics)."
         }
       },
       "additionalProperties": false
@@ -164,15 +235,18 @@
       "properties": {
         "id": { "type": "string" },
         "name": { "type": "string" },
-        "type": { "enum": ["human", "machine", "material"] },
+        "type": { "enum": ["human", "machine", "material", "cost"] },
         "attributes": {
           "type": "object",
           "properties": {
             "capacity": {},
-            "cost_rate": {}
+            "cost_rate": {},
+            "basis_unit": { "type": "string" }
           },
           "additionalProperties": true
-        }
+        },
+        "description": { "type": "string" },
+        "description_status": { "enum": ["empty", "suggested", "custom", "approved"] }
       },
       "additionalProperties": false
     },
@@ -185,7 +259,14 @@
         "fields": {
           "type": "object",
           "properties": {
-            "target": { "type": "string" },
+            "target": {
+              "type": "string",
+              "description": "Stable reference value: a node id, edge id, or resource id; the literal \"graph\" for the whole graph; or \"\" when unspecified."
+            },
+            "scope": {
+              "type": "string",
+              "description": "Optional free-text qualification of the target (e.g. \"month-end\", \"per shift\")."
+            },
             "metric": { "type": "string" },
             "operator": { "type": "string" },
             "value": { "type": "string" },
@@ -194,7 +275,29 @@
           },
           "additionalProperties": true
         },
-        "expression": { "type": "string" }
+        "expression": { "type": "string" },
+        "description": { "type": "string" },
+        "description_status": { "enum": ["empty", "suggested", "custom", "approved"] }
+      },
+      "additionalProperties": false
+    },
+    "saved_view": {
+      "type": "object",
+      "required": ["id", "name", "filter"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "filter": {
+          "type": "object",
+          "properties": {
+            "flow_kinds": { "type": "array", "items": { "type": "string" } },
+            "edge_types": { "type": "array", "items": { "type": "string" } },
+            "node_types": { "type": "array", "items": { "type": "string" } },
+            "focus_selection": { "type": "boolean" },
+            "hops": { "type": "number" }
+          },
+          "additionalProperties": true
+        }
       },
       "additionalProperties": false
     },

@@ -1,14 +1,25 @@
-# Python
 __pycache__/
 *.py[cod]
-*.pyo
+.pytest_cache/
+pytest-tmp/
+pytest-cache-files-*/
+tmp-check/
+.test-data/
+*.tmp
+
 .venv/
 venv/
+env/
+
 .env
+.env.*
 
-# Local graph data (not committed — persisted via volume or database)
+backend/data/
+app/data/
 data/
+server.out.log
+server.err.log
 
-# OS
+.claude/
 .DS_Store
 Thumbs.db

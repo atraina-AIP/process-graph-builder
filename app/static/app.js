@@ -1,26 +1,24 @@
 "use strict";
 
 const STORAGE_KEY = "process-graph-builder-state-v1";
+const LIBRARY_KEY = "process-graph-builder-library-v1";
 const API_BASE_STORAGE_KEY = "process-graph-builder-api-base";
+const CURRENT_SAMPLE_GRAPH_ID = "pg-make-to-order";
+const LEGACY_SAMPLE_GRAPH_IDS = ["pg-intake-to-close"];
+const LEGACY_SAMPLE_GRAPH_NAMES = ["Intake to Close", "Supplier Invoice to Posted", "Invoice to Posted"];
+
+// Current graph-schema version, mirroring the `$comment` version in
+// schema/process-graph.schema.json. Stamped into the export envelope
+// (P0-0) so downstream tools know which contract an artifact targets.
+const SCHEMA_VERSION = "v5";
 
 const MODELING_STYLES = ["none", "business_process", "value_stream", "system_flow", "team_topology", "custom"];
-const NODE_TYPES = ["source", "sink", "task", "decision"];
+const NODE_TYPES = ["source", "sink", "task", "decision", "resource"];
 const NODE_DESCRIPTION_STATUSES = ["empty", "suggested", "custom", "approved"];
 const EDGE_TYPES = ["flow", "dependency", "trigger", "feedback", "allocation", "custom"];
 const FLOW_KINDS = ["parts", "cash", "energy", "information", "data", "work", "approval", "custom"];
-const RESOURCE_TYPES = ["human", "machine", "material"];
+const RESOURCE_TYPES = ["human", "machine", "material", "cost"];
 const CONSTRAINT_TYPES = ["flow_balance", "capability_limit", "timing", "routing_rule", "policy_rule"];
-const CONSTRAINT_OPERATORS = [
-  "equals",
-  "at_most",
-  "at_least",
-  "requires",
-  "routes_to",
-  "allowed_when",
-  "blocked_when",
-  "lasts",
-  "custom",
-];
 const MUTATION_ACTIONS = [
   "add_node",
   "update_node",
@@ -37,44 +35,6 @@ const MUTATION_ACTIONS = [
 ];
 
 const GRAPH_MUTATION_ACTIONS = ["add_node", "update_node", "delete_node", "add_edge", "update_edge", "delete_edge"];
-
-const CONSTRAINT_TEMPLATES = {
-  flow_balance: {
-    metric: "incoming and outgoing flow",
-    operator: "equals",
-    value: "",
-    unit: "",
-    notes: "Account for transformation, accumulation, loss, scrap, waste, or storage.",
-  },
-  capability_limit: {
-    metric: "resource or capacity",
-    operator: "requires",
-    value: "",
-    unit: "",
-    notes: "Describe what this node needs and what it can handle.",
-  },
-  timing: {
-    metric: "duration",
-    operator: "lasts",
-    value: "",
-    unit: "",
-    notes: "Describe how long this node or movement takes.",
-  },
-  routing_rule: {
-    metric: "branch",
-    operator: "routes_to",
-    value: "",
-    unit: "",
-    notes: "Describe when flow goes one way instead of another.",
-  },
-  policy_rule: {
-    metric: "rule",
-    operator: "allowed_when",
-    value: "",
-    unit: "",
-    notes: "Describe what is allowed, blocked, or required.",
-  },
-};
 
 const OFFICIAL_REFERENCES = {
   bpmn: {
@@ -111,6 +71,7 @@ const NOTATION_PROFILES = {
       ["Task", "Transformation step"],
       ["Decision", "Branch point"],
       ["Sink", "Terminal boundary"],
+      ["Resource", "Resource definition (cylinder)"],
     ],
     edgeLegend: [
       ["Flow", "Solid arrow"],
@@ -129,6 +90,7 @@ const NOTATION_PROFILES = {
       ["Task", "Rounded activity box"],
       ["Decision", "Gateway diamond"],
       ["End / sink", "Heavy event circle"],
+      ["Resource", "Resource definition (cylinder)"],
     ],
     edgeLegend: [
       ["Flow", "Solid sequence arrow"],
@@ -147,6 +109,7 @@ const NOTATION_PROFILES = {
       ["Task", "Process box with data strip"],
       ["Decision", "Control branch"],
       ["Flow", "Material or information movement"],
+      ["Resource", "Resource definition (cylinder)"],
     ],
     edgeLegend: [
       ["Parts/material", "Heavy material arrow"],
@@ -165,6 +128,7 @@ const NOTATION_PROFILES = {
       ["Port", "Square boundary handle"],
       ["Decision", "Control diamond"],
       ["External", "Double-boundary block"],
+      ["Resource", "Resource definition (cylinder)"],
     ],
     edgeLegend: [
       ["Item flow", "Solid connector"],
@@ -183,6 +147,7 @@ const NOTATION_PROFILES = {
       ["Platform", "Service platform band"],
       ["Enabling", "Dashed helper team"],
       ["Complicated subsystem", "Specialist hex block"],
+      ["Resource", "Resource definition (cylinder)"],
     ],
     edgeLegend: [
       ["Allocation", "X-as-a-Service style"],
@@ -201,6 +166,7 @@ const NOTATION_PROFILES = {
       ["Port", "Explicit input/output handle"],
       ["Decision", "Branching element"],
       ["Boundary", "Graph boundary"],
+      ["Resource", "Resource definition (cylinder)"],
     ],
     edgeLegend: [
       ["Flow", "Typed payload movement"],
@@ -258,6 +224,10 @@ const DEFAULT_ONTOLOGY = {
     sink: {
       label: "Sink",
       description: "A terminal boundary where the process outcome leaves the graph or is considered closed.",
+    },
+    resource: {
+      label: "Resource",
+      description: "A resource definition (human, machine, material, or cost). It feeds a task via an allocation edge (resource → task) that carries the quantity.",
     },
   },
   edge_types: {
@@ -346,6 +316,7 @@ const DEFAULT_ONTOLOGY = {
     human: { label: "Human", description: "People, teams, roles, or skills used by process steps." },
     machine: { label: "Machine", description: "Equipment, systems, tooling, or automated capacity." },
     material: { label: "Material", description: "Physical or informational material consumed, transformed, or moved." },
+    cost: { label: "Cost", description: "A monetary cost driver with a rate and a free-text basis unit (e.g. per hour, per unit, per shipment, fixed)." },
   },
   properties: {
     node_definition: {
@@ -398,6 +369,7 @@ Allowed node types:
 - sink
 - task
 - decision
+- resource
 
 Allowed edge types:
 - flow
@@ -454,177 +426,53 @@ Allowed mutations:
 - add_question`;
 
 const sampleGraph = {
-  id: "pg-intake-to-close",
-  name: "Intake to Close",
+  id: CURRENT_SAMPLE_GRAPH_ID,
+  name: "Make-to-Order Line",
   version: "0.1.0",
-  description: "Decision-grade process graph for intake, validation, routing, and closure.",
+  description: "Make-to-order manufacturing line (order → machine → inspect → assemble → ship) that exercises every graph feature.",
   modeling_style: "none",
   nodes: [
-    {
-      id: "n_customer_request",
-      name: "Customer request",
-      type: "source",
-      inputs: [],
-      outputs: ["request"],
-      resources_required: [],
-      attributes: {},
-      notes: "External demand enters the process.",
-    },
-    {
-      id: "n_validate_request",
-      name: "Validate request",
-      type: "task",
-      inputs: ["request"],
-      outputs: ["validated request"],
-      resources_required: [{ resource_id: "r_coordinator", name: "Process coordinator", quantity: "1" }],
-      attributes: {},
-      notes: "Review request completeness before routing.",
-    },
-    {
-      id: "n_request_complete",
-      name: "Is request complete",
-      type: "decision",
-      inputs: ["validated request"],
-      outputs: ["complete request", "incomplete request"],
-      resources_required: [{ resource_id: "r_coordinator", name: "Process coordinator", quantity: "1" }],
-      attributes: {},
-      notes: "Decision node should have at least two outgoing branches.",
-    },
-    {
-      id: "n_route_work",
-      name: "Route work",
-      type: "task",
-      inputs: ["complete request"],
-      outputs: ["routed work"],
-      resources_required: [{ resource_id: "r_coordinator", name: "Process coordinator", quantity: "1" }],
-      attributes: {},
-      notes: "Assign routed work to the correct owner.",
-    },
-    {
-      id: "n_request_clarification",
-      name: "Request clarification",
-      type: "task",
-      inputs: ["incomplete request"],
-      outputs: ["clarification request"],
-      resources_required: [{ resource_id: "r_coordinator", name: "Process coordinator", quantity: "1" }],
-      attributes: {},
-      notes: "Clarify missing information before returning to validation.",
-    },
-    {
-      id: "n_closed",
-      name: "Closed",
-      type: "sink",
-      inputs: ["routed work"],
-      outputs: [],
-      resources_required: [],
-      attributes: {},
-      notes: "Terminal state for the MVP sample process.",
-    },
+    { id: "n_order", name: "Customer order", type: "source", inputs: [], outputs: ["order"], attributes: {}, perspectives: [{ label: "Commercial", text: "Orders arrive through the B2B portal with a promised 10-day lead time." }, { label: "Risk", text: "Rush orders can overload the machining cell." }] },
+    { id: "n_power", name: "Power supply", type: "source", inputs: [], outputs: ["power"], attributes: {}, description: "Grid and on-site supply feeding the machining cell." },
+    { id: "n_plan", name: "Plan production", type: "task", inputs: ["order"], outputs: ["work order"], attributes: { duration: "2 h", planner: "MRP" } },
+    { id: "n_purchase", name: "Purchase material", type: "task", inputs: ["work order"], outputs: ["raw stock"], attributes: { lead_time: "5 d", reorder_point: "50" } },
+    { id: "n_machining", name: "CNC machining", type: "task", inputs: ["raw stock", "power"], outputs: ["machined part", "measurements"], attributes: { cycle_time: "45 s" }, description: "Cuts raw stock into machined parts on the CNC cell and records inspection measurements.", description_status: "approved" },
+    { id: "n_qc", name: "Quality check", type: "decision", inputs: ["machined part"], outputs: ["good part", "defective part"], attributes: {} },
+    { id: "n_rework", name: "Rework", type: "task", inputs: ["defective part"], outputs: ["reworked part"], attributes: {} },
+    { id: "n_assemble", name: "Assemble", type: "task", inputs: ["good part"], outputs: ["assembled unit"], attributes: {}, perspectives: [{ label: "Quality", text: "Torque specs are verified during assembly." }] },
+    { id: "n_ship", name: "Ship order", type: "task", inputs: ["assembled unit"], outputs: ["shipment"], attributes: { carrier: "ground", incoterm: "FOB" } },
+    { id: "n_fulfilled", name: "Order fulfilled", type: "sink", inputs: ["shipment"], outputs: [], attributes: {} },
+    { id: "r_cnc", name: "CNC machine", type: "resource", inputs: [], outputs: [], attributes: { kind: "machine", cost_rate: "40", basis_unit: "hour", capacity: "1 job" }, description: "3-axis CNC machining center." },
+    { id: "r_operator", name: "Machine operator", type: "resource", inputs: [], outputs: [], attributes: { kind: "human", cost_rate: "32", basis_unit: "hour" }, description: "Certified CNC operator." },
+    { id: "r_energy_budget", name: "Energy budget", type: "resource", inputs: [], outputs: [], attributes: { kind: "cost", cost_rate: "0.12", basis_unit: "kWh" }, description: "Metered electricity cost pool." },
   ],
   edges: [
-    {
-      id: "e_customer_request_validate_request",
-      from_node: "n_customer_request",
-      to_node: "n_validate_request",
-      type: "flow",
-      condition: "",
-      flows: [{ id: "f_customer_request", name: "request", kind: "information", quantity: "", unit: "", properties: {} }],
-    },
-    {
-      id: "e_validate_request_request_complete",
-      from_node: "n_validate_request",
-      to_node: "n_request_complete",
-      type: "flow",
-      condition: "",
-      flows: [{ id: "f_validated_request", name: "validated request", kind: "information", quantity: "", unit: "", properties: {} }],
-    },
-    {
-      id: "e_request_complete_route_work",
-      from_node: "n_request_complete",
-      to_node: "n_route_work",
-      type: "flow",
-      condition: "if complete",
-      flows: [{ id: "f_complete_request", name: "complete request", kind: "information", quantity: "", unit: "", properties: {} }],
-    },
-    {
-      id: "e_request_complete_request_clarification",
-      from_node: "n_request_complete",
-      to_node: "n_request_clarification",
-      type: "flow",
-      condition: "if incomplete",
-      flows: [{ id: "f_incomplete_request", name: "incomplete request", kind: "information", quantity: "", unit: "", properties: {} }],
-    },
-    {
-      id: "e_request_clarification_validate_request",
-      from_node: "n_request_clarification",
-      to_node: "n_validate_request",
-      type: "feedback",
-      condition: "",
-      flows: [{ id: "f_clarification_request", name: "clarification request", kind: "information", quantity: "", unit: "", properties: {} }],
-    },
-    {
-      id: "e_route_work_closed",
-      from_node: "n_route_work",
-      to_node: "n_closed",
-      type: "flow",
-      condition: "",
-      flows: [{ id: "f_routed_work", name: "routed work", kind: "work", quantity: "", unit: "", properties: {} }],
-    },
+    { id: "e_order_plan", from_node: "n_order", to_node: "n_plan", type: "trigger", condition: "", flows: [{ id: "f_order", name: "order", kind: "information", quantity: "", unit: "", properties: {} }] },
+    { id: "e_plan_purchase", from_node: "n_plan", to_node: "n_purchase", type: "flow", condition: "", flows: [{ id: "f_work_order", name: "work order", kind: "data", quantity: "", unit: "", properties: {} }] },
+    { id: "e_purchase_machining", from_node: "n_purchase", to_node: "n_machining", type: "flow", condition: "", flows: [{ id: "f_raw_stock", name: "raw stock", kind: "parts", quantity: "100", unit: "kg", properties: {} }] },
+    { id: "e_power_machining", from_node: "n_power", to_node: "n_machining", type: "flow", condition: "", flows: [{ id: "f_power", name: "power", kind: "energy", quantity: "15", unit: "kWh", properties: {} }] },
+    { id: "e_machining_qc", from_node: "n_machining", to_node: "n_qc", type: "flow", condition: "", description: "Machined parts move to inspection with their measurement data.", properties: { takt_time: "45 s" }, flows: [{ id: "f_machined_part", name: "machined part", kind: "parts", quantity: "100", unit: "pcs", properties: {} }, { id: "f_measurements", name: "inspection measurements", kind: "data", quantity: "", unit: "", properties: {} }] },
+    { id: "e_qc_assemble", from_node: "n_qc", to_node: "n_assemble", type: "flow", condition: "if pass", flows: [{ id: "f_good_part", name: "good part", kind: "parts", quantity: "", unit: "", properties: {} }] },
+    { id: "e_qc_rework", from_node: "n_qc", to_node: "n_rework", type: "flow", condition: "if fail", flows: [{ id: "f_defective_part", name: "defective part", kind: "parts", quantity: "", unit: "", properties: {} }] },
+    { id: "e_rework_qc", from_node: "n_rework", to_node: "n_qc", type: "feedback", condition: "", flows: [{ id: "f_reworked_part", name: "reworked part", kind: "parts", quantity: "", unit: "", properties: {} }] },
+    { id: "e_assemble_ship", from_node: "n_assemble", to_node: "n_ship", type: "flow", condition: "", flows: [{ id: "f_assembled_unit", name: "assembled unit", kind: "parts", quantity: "", unit: "", properties: {} }, { id: "f_pack", name: "pack and label", kind: "work", quantity: "", unit: "", properties: {} }] },
+    { id: "e_ship_fulfilled", from_node: "n_ship", to_node: "n_fulfilled", type: "flow", condition: "", perspectives: [{ label: "Finance", text: "Invoice payment is captured on shipment." }], flows: [{ id: "f_release", name: "shipping release", kind: "approval", quantity: "", unit: "", properties: {} }, { id: "f_payment", name: "invoice payment", kind: "cash", quantity: "1", unit: "invoice", properties: {} }] },
+    { id: "e_purchase_assemble_dep", from_node: "n_purchase", to_node: "n_assemble", type: "dependency", condition: "", flows: [] },
+    { id: "e_energy_machining_custom", from_node: "r_energy_budget", to_node: "n_machining", type: "custom", condition: "", flows: [{ id: "f_metered", name: "metered energy", kind: "custom", quantity: "", unit: "", properties: {} }] },
+    { id: "e_alloc_cnc_machining", from_node: "r_cnc", to_node: "n_machining", type: "allocation", condition: "qty: 1", properties: { quantity: "1" }, flows: [] },
+    { id: "e_alloc_operator_machining", from_node: "r_operator", to_node: "n_machining", type: "allocation", condition: "qty: 1", properties: { quantity: "1" }, flows: [] },
   ],
-  resources: [
-    {
-      id: "r_coordinator",
-      name: "Process coordinator",
-      type: "human",
-      attributes: {},
-    },
-  ],
+  resources: [],
   constraints: [
-    {
-      id: "c_request_completion_balance",
-      type: "flow_balance",
-      fields: {
-        target: "Is request complete",
-        metric: "request",
-        operator: "equals",
-        value: "complete request or incomplete request",
-        unit: "",
-        notes: "The decision accounts for each validated request as complete or incomplete.",
-      },
-      expression: "",
-    },
-    {
-      id: "c_request_route_rule",
-      type: "routing_rule",
-      fields: {
-        target: "Is request complete",
-        metric: "branch",
-        operator: "routes_to",
-        value: "complete request to Route work; incomplete request to Request clarification",
-        unit: "",
-        notes: "Branching is represented by conditioned outgoing edges.",
-      },
-      expression: "",
-    },
-    {
-      id: "c_validate_capability",
-      type: "capability_limit",
-      fields: {
-        target: "Validate request",
-        metric: "Process coordinator",
-        operator: "requires",
-        value: "1",
-        unit: "person",
-        notes: "Validation needs one coordinator resource.",
-      },
-      expression: "",
-    },
+    { id: "c_qc_balance", type: "flow_balance", fields: { target: "n_qc" }, expression: "Every machined part leaves Quality check as either a good part (to Assemble) or a defective part (to Rework)." },
+    { id: "c_qc_routing", type: "routing_rule", fields: { target: "n_qc" }, expression: "Pass parts route to Assemble; fail parts route to Rework." },
+    { id: "c_cnc_capacity", type: "capability_limit", fields: { target: "n_machining" }, expression: "CNC machining runs one job at a time; extra jobs queue until the cell is free." },
+    { id: "c_rework_timing", type: "timing", fields: { target: "e_rework_qc" }, expression: "Reworked parts must return to inspection within 2 hours." },
+    { id: "c_ship_policy", type: "policy_rule", fields: { target: "n_ship" }, expression: "Do not ship before quality sign-off and shipping release." },
   ],
   assumptions: [
-    {
-      id: "a_request_return_loop",
-      text: "Incomplete requests return to validation after clarification.",
-    },
+    { id: "a_lead_time", text: "Promised lead time is 10 working days from order to shipment." },
+    { id: "a_single_shift", text: "The machining cell runs one shift unless rush orders require overtime." },
   ],
   metadata: {
     created_by: "Codex MVP",
@@ -635,36 +483,47 @@ const sampleGraph = {
 };
 
 const sampleLayout = {
-  n_customer_request: { x: 80, y: 180 },
-  n_validate_request: { x: 290, y: 180 },
-  n_request_complete: { x: 515, y: 178 },
-  n_route_work: { x: 760, y: 105 },
-  n_request_clarification: { x: 760, y: 275 },
-  n_closed: { x: 980, y: 105 },
+  n_order: { x: 60, y: 200 },
+  n_power: { x: 300, y: 50 },
+  n_plan: { x: 280, y: 200 },
+  n_purchase: { x: 500, y: 200 },
+  n_machining: { x: 720, y: 200 },
+  n_qc: { x: 940, y: 200 },
+  n_rework: { x: 940, y: 380 },
+  n_assemble: { x: 1160, y: 200 },
+  n_ship: { x: 1380, y: 200 },
+  n_fulfilled: { x: 1580, y: 200 },
+  r_cnc: { x: 680, y: 380 },
+  r_operator: { x: 800, y: 380 },
+  r_energy_budget: { x: 720, y: 470 },
 };
 
 let graph = clone(sampleGraph);
 let layout = clone(sampleLayout);
-let selected = { kind: "node", id: "n_request_complete" };
+let selected = { kind: "node", id: "n_machining" };
 let pendingPlan = null;
 let mutationLog = [];
 let openQuestions = [];
 let allowCycles = true;
+let validateCurrentView = false;
 let dragState = null;
 let connectState = null;
 let panState = null;
 let toastTimer = null;
-let activeInspectorTab = "inspect";
 let addNodeFormOpen = false;
-let addEdgeFormOpen = false;
-let resourcesOpen = false;
-let constraintsOpen = false;
 let leftPanelCollapsed = false;
-let rightPanelCollapsed = false;
+let legendCollapsed = false;
 let chatMessages = [];
 let undoStack = [];
 let clarificationContext = null;
 let canvasView = { x: 0, y: 0, zoom: 1 };
+let activeFilter = createEmptyFilter();
+let currentFileHandle = null;
+let currentFileName = "";
+// In-memory id of the saved view whose filter is currently applied (null when
+// the active filter is a custom/unsaved combination). Persisted as UI state in
+// the envelope (active_view_id) but never stored on the graph.
+let activeViewId = null;
 
 const els = {};
 
@@ -678,15 +537,51 @@ document.addEventListener("DOMContentLoaded", () => {
 function bindElements() {
   [
     "resetGraphButton",
+    "clearGraphButton",
     "autoLayoutButton",
-    "copyJsonButton",
-    "exportJsonButton",
-    "exportMarkdownButton",
+    "addNodeSelect",
+    "importFileInput",
+    "openSaveButton",
+    "openLoadButton",
+    "saveDialog",
+    "saveGraphName",
+    "saveToLibraryButton",
+    "saveToOpenedFileButton",
+    "saveAsFileButton",
+    "saveExportJsonButton",
+    "saveExportMarkdownButton",
+    "saveCopyJsonButton",
+    "fileSaveStatus",
+    "closeSaveButton",
+    "libraryDialog",
+    "closeLibraryButton",
+    "openFilePickerButton",
+    "importFromFileButton",
+    "libraryList",
+    "elementEditorDialog",
+    "elementEditorTitle",
+    "closeElementEditorButton",
+    "editorDetailsPanel",
+    "editorConstraintsPanel",
+    "elementConstraints",
+    "openOntologyButton",
+    "ontologyDialog",
+    "closeOntologyButton",
+    "openValidationButton",
+    "validationDialog",
+    "closeValidationButton",
+    "validationStatusDot",
+    "saveExportDesignSpaceButton",
+    "openDesignSpaceButton",
+    "designSpaceDialog",
+    "closeDesignSpaceButton",
+    "designSpaceVariables",
+    "designSpaceObjectives",
+    "designSpaceBudgets",
+    "designSpaceNotes",
     "workspace",
     "leftPanel",
-    "rightPanel",
     "toggleLeftPanelButton",
-    "toggleRightPanelButton",
     "chatInput",
     "sendInstructionButton",
     "planMutationsButton",
@@ -705,36 +600,31 @@ function bindElements() {
     "edgeCount",
     "selectedStatus",
     "inspectorContent",
-    "inspectorSubhead",
-    "edgeFromSelect",
-    "edgeToSelect",
-    "edgeTypeSelect",
-    "edgeTypeHelp",
-    "edgeConditionInput",
-    "edgeFlowNameInput",
-    "edgeFlowKindSelect",
-    "edgeFlowKindHelp",
-    "toggleAddEdgeButton",
-    "edgeBuilderBody",
-    "addEdgeButton",
     "zoomOutButton",
     "zoomLevelLabel",
     "zoomInButton",
     "fitCanvasButton",
     "resetViewButton",
+    "viewsButton",
+    "viewsPopover",
+    "viewsCloseButton",
+    "viewFlowKindChips",
+    "viewEdgeTypeChips",
+    "viewNodeTypeChips",
+    "viewFocusSelection",
+    "viewClearButton",
+    "savedViewsList",
+    "savedViewNameInput",
+    "saveViewButton",
+    "viewStatus",
     "notationLegend",
+    "legendToggleButton",
     "canvasMinimap",
     "validationList",
     "readinessBadge",
     "allowCyclesInput",
-    "resourceList",
-    "resourceCount",
-    "toggleResourcesButton",
-    "constraintList",
-    "constraintCount",
-    "toggleConstraintsButton",
-    "addResourceButton",
-    "addConstraintButton",
+    "validateViewInput",
+    "validationScopeNote",
     "ontologySearchInput",
     "inferOntologyButton",
     "ontologyContent",
@@ -751,12 +641,21 @@ function bindEvents() {
     button.addEventListener("click", () => switchTab(button.dataset.tab));
   });
 
-  document.querySelectorAll("[data-add-node]").forEach((button) => {
-    button.addEventListener("click", () => addNodeFromToolbar(button.dataset.addNode));
-  });
+  // #notationLegend (and its toggle button) is re-rendered on each render(),
+  // so delegate the toggle click from the stable container element.
+  if (els.notationLegend) {
+    els.notationLegend.addEventListener("click", (event) => {
+      if (event.target.closest("#legendToggleButton")) {
+        toggleLegendCollapsed();
+      }
+    });
+  }
 
-  document.querySelectorAll("[data-inspector-tab]").forEach((button) => {
-    button.addEventListener("click", () => switchInspectorTab(button.dataset.inspectorTab));
+  els.addNodeSelect.addEventListener("change", (event) => {
+    const type = event.target.value;
+    if (!type) return;
+    addNodeFromToolbar(type);
+    event.target.value = "";
   });
 
   els.planMutationsButton.addEventListener("click", planFromInstruction);
@@ -811,46 +710,76 @@ function bindEvents() {
     });
     saveState();
   });
-  els.toggleRightPanelButton.addEventListener("click", () => {
-    toggleRightPanel();
-  });
 
-  els.edgeTypeSelect.addEventListener("change", renderEdgeTypeHelp);
-  els.edgeFlowKindSelect.addEventListener("change", renderEdgeFlowKindHelp);
   els.modelingStyleOptions.addEventListener("change", handleModelingStyleChange);
-  els.toggleAddEdgeButton.addEventListener("click", () => {
-    addEdgeFormOpen = !addEdgeFormOpen;
-    renderEdgeBuilder();
-    saveState();
-  });
-  els.addEdgeButton.addEventListener("click", addEdgeFromInspector);
-  els.addResourceButton.addEventListener("click", addResource);
-  els.addConstraintButton.addEventListener("click", addConstraint);
-  els.toggleResourcesButton.addEventListener("click", () => {
-    resourcesOpen = !resourcesOpen;
-    renderResources();
-    saveState();
-  });
-  els.toggleConstraintsButton.addEventListener("click", () => {
-    constraintsOpen = !constraintsOpen;
-    renderConstraints();
-    saveState();
-  });
   els.autoLayoutButton.addEventListener("click", () => {
     autoLayoutGraph();
     render();
     toast("Graph laid out");
   });
-  els.exportMarkdownButton.addEventListener("click", downloadMarkdown);
-  els.exportJsonButton.addEventListener("click", downloadGraphJson);
-  els.copyJsonButton.addEventListener("click", copyGraphJson);
+  els.importFileInput.addEventListener("change", (event) => {
+    const file = event.target.files && event.target.files[0];
+    if (file) importGraphFromFile(file, { clearFileHandle: true });
+    event.target.value = "";
+  });
+  els.openSaveButton.addEventListener("click", openSaveDialog);
+  els.closeSaveButton.addEventListener("click", closeSaveDialog);
+  els.saveToLibraryButton.addEventListener("click", () => saveCurrentToLibrary(els.saveGraphName.value));
+  els.saveToOpenedFileButton.addEventListener("click", saveGraphToOpenedFile);
+  els.saveAsFileButton.addEventListener("click", saveGraphAsFile);
+  els.saveExportJsonButton.addEventListener("click", downloadGraphJson);
+  els.saveExportMarkdownButton.addEventListener("click", downloadMarkdown);
+  els.saveCopyJsonButton.addEventListener("click", copyGraphJson);
+  els.openLoadButton.addEventListener("click", openLibrary);
+  els.closeLibraryButton.addEventListener("click", closeLibrary);
+  els.openFilePickerButton.addEventListener("click", openGraphFileWithPicker);
+  els.importFromFileButton.addEventListener("click", () => els.importFileInput.click());
+  els.closeElementEditorButton.addEventListener("click", closeElementEditor);
+  document.querySelectorAll("[data-editor-tab]").forEach((button) => {
+    button.addEventListener("click", () => switchEditorTab(button.dataset.editorTab));
+  });
+  els.elementConstraints.addEventListener("input", handleElementConstraintInput);
+  els.elementConstraints.addEventListener("change", handleElementConstraintInput);
+  els.elementConstraints.addEventListener("click", handleElementConstraintClick);
+  els.openOntologyButton.addEventListener("click", openOntologyDialog);
+  els.closeOntologyButton.addEventListener("click", closeOntologyDialog);
+  els.openValidationButton.addEventListener("click", openValidationDialog);
+  els.closeValidationButton.addEventListener("click", closeValidationDialog);
+  els.openDesignSpaceButton.addEventListener("click", openDesignSpaceDialog);
+  els.closeDesignSpaceButton.addEventListener("click", closeDesignSpaceDialog);
+  els.saveExportDesignSpaceButton.addEventListener("click", downloadDesignSpaceJson);
+  // Text inputs patch state in place (no re-render, preserves focus); add/delete
+  // and select changes re-render the dialog.
+  els.designSpaceObjectives.addEventListener("input", handleDesignSpaceObjectiveInput);
+  els.designSpaceObjectives.addEventListener("change", handleDesignSpaceObjectiveInput);
+  els.designSpaceObjectives.addEventListener("click", handleDesignSpaceObjectiveClick);
+  els.designSpaceBudgets.addEventListener("input", handleDesignSpaceBudgetInput);
+  els.designSpaceBudgets.addEventListener("click", handleDesignSpaceBudgetClick);
+  els.designSpaceNotes.addEventListener("input", handleDesignSpaceNotesInput);
+  els.libraryList.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-library-action]");
+    if (!button) return;
+    const row = button.closest("[data-entry-id]");
+    if (!row) return;
+    const action = button.dataset.libraryAction;
+    if (action === "load") loadFromLibrary(row.dataset.entryId);
+    else if (action === "duplicate") duplicateLibraryEntry(row.dataset.entryId);
+    else if (action === "delete") deleteLibraryEntry(row.dataset.entryId);
+  });
   els.resetGraphButton.addEventListener("click", resetGraph);
+  els.clearGraphButton.addEventListener("click", clearGraph);
   els.allowCyclesInput.addEventListener("change", () => {
     allowCycles = els.allowCyclesInput.checked;
     renderValidation();
     saveState();
   });
+  els.validateViewInput.addEventListener("change", () => {
+    validateCurrentView = els.validateViewInput.checked;
+    renderValidation();
+    saveState();
+  });
 
+  els.graphCanvas.addEventListener("dblclick", handleCanvasDoubleClick);
   els.graphCanvas.addEventListener("pointerdown", handleCanvasPointerDown);
   els.graphCanvas.addEventListener("pointermove", handleCanvasPointerMove);
   els.graphCanvas.addEventListener("pointerup", handleCanvasPointerUp);
@@ -862,15 +791,36 @@ function bindEvents() {
   els.zoomInButton.addEventListener("click", () => zoomCanvasBy(1.22));
   els.fitCanvasButton.addEventListener("click", fitCanvasToGraph);
   els.resetViewButton.addEventListener("click", resetCanvasView);
+  els.viewsButton.addEventListener("click", toggleViewsPopover);
+  els.viewsCloseButton.addEventListener("click", closeViewsPopover);
+  els.viewsPopover.addEventListener("click", (event) => {
+    const chip = event.target.closest("[data-view-dim]");
+    if (chip) toggleViewFilter(chip.dataset.viewDim, chip.dataset.viewValue);
+  });
+  els.viewFocusSelection.addEventListener("change", toggleFocusSelection);
+  els.viewClearButton.addEventListener("click", clearViewFilter);
+  els.saveViewButton.addEventListener("click", () => saveCurrentView(els.savedViewNameInput.value));
+  els.savedViewNameInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      saveCurrentView(els.savedViewNameInput.value);
+    }
+  });
+  els.savedViewsList.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-view-action]");
+    if (!button) return;
+    const id = button.dataset.viewId;
+    if (button.dataset.viewAction === "apply") applySavedView(id);
+    else if (button.dataset.viewAction === "delete") deleteSavedView(id);
+  });
+  els.viewStatus.addEventListener("click", (event) => {
+    if (event.target.closest(".view-clear")) clearViewFilter();
+  });
   els.canvasMinimap.addEventListener("pointerdown", handleMinimapPointerDown);
 
   els.inspectorContent.addEventListener("input", handleInspectorInput);
   els.inspectorContent.addEventListener("change", handleInspectorInput);
   els.inspectorContent.addEventListener("click", handleInspectorClick);
-  els.resourceList.addEventListener("input", handleResourceInput);
-  els.resourceList.addEventListener("change", handleResourceInput);
-  els.constraintList.addEventListener("input", handleConstraintInput);
-  els.constraintList.addEventListener("change", handleConstraintInput);
   els.ontologySearchInput.addEventListener("input", renderOntology);
   els.inferOntologyButton.addEventListener("click", () => {
     inferOntologyFromGraph();
@@ -892,67 +842,628 @@ function switchTab(tabName) {
   });
 }
 
-function switchInspectorTab(tabName) {
-  activeInspectorTab = tabName;
-  document.querySelectorAll("[data-inspector-tab]").forEach((button) => {
-    button.classList.toggle("is-active", button.dataset.inspectorTab === tabName);
-  });
-  ["inspect", "ontology"].forEach((name) => {
-    const view = document.getElementById(`${name}View`);
-    view.classList.toggle("is-active", name === tabName);
-  });
-  if (tabName === "ontology") renderOntology();
+// Restores the full working state from a snake_case envelope (the shape
+// serializeState/exportEnvelope produce). camelCase fallbacks migrate state
+// saved by older builds. Shared by loadState (localStorage) and the library.
+function applyEnvelopeToState(env) {
+  graph = env.graph;
+  layout = env.layout || {};
+  selected = env.selected || selected;
+  mutationLog = readEnvelopeField(env, "mutation_log", "mutationLog", []) || [];
+  openQuestions = readEnvelopeField(env, "open_questions", "openQuestions", []) || [];
+  const savedAllowCycles = readEnvelopeField(env, "allow_cycles", "allowCycles", undefined);
+  allowCycles = savedAllowCycles !== undefined ? Boolean(savedAllowCycles) : true;
+  validateCurrentView = Boolean(readEnvelopeField(env, "validate_current_view", "validateCurrentView", false));
+  addNodeFormOpen = Boolean(readEnvelopeField(env, "add_node_form_open", "addNodeFormOpen", false));
+  leftPanelCollapsed = Boolean(readEnvelopeField(env, "left_panel_collapsed", "leftPanelCollapsed", false));
+  legendCollapsed = Boolean(readEnvelopeField(env, "legend_collapsed", "legendCollapsed", false));
+  const savedChat = readEnvelopeField(env, "chat_messages", "chatMessages", []);
+  chatMessages = Array.isArray(savedChat) ? savedChat : [];
+  const savedUndo = readEnvelopeField(env, "undo_stack", "undoStack", []);
+  undoStack = Array.isArray(savedUndo) ? savedUndo : [];
+  clarificationContext = readEnvelopeField(env, "clarification_context", "clarificationContext", null) || null;
+  canvasView = normalizeCanvasView(readEnvelopeField(env, "canvas_view", "canvasView", canvasView));
+  activeFilter = normalizeFilter(readEnvelopeField(env, "active_filter", "activeFilter", null));
+  ensureGraphShape();
+  const savedViewId = readEnvelopeField(env, "active_view_id", "activeViewId", null);
+  activeViewId = graph.saved_views.some((view) => view.id === savedViewId) ? savedViewId : null;
+  normalizeLayout();
 }
 
 function loadState() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
     if (!saved || !saved.graph) return;
-    graph = saved.graph;
-    layout = saved.layout || {};
-    selected = saved.selected || selected;
-    mutationLog = saved.mutationLog || [];
-    openQuestions = saved.openQuestions || [];
-    allowCycles = saved.allowCycles !== undefined ? Boolean(saved.allowCycles) : true;
-    addNodeFormOpen = Boolean(saved.addNodeFormOpen);
-    addEdgeFormOpen = Boolean(saved.addEdgeFormOpen);
-    resourcesOpen = Boolean(saved.resourcesOpen);
-    constraintsOpen = Boolean(saved.constraintsOpen);
-    leftPanelCollapsed = Boolean(saved.leftPanelCollapsed);
-    rightPanelCollapsed = Boolean(saved.rightPanelCollapsed);
-    chatMessages = Array.isArray(saved.chatMessages) ? saved.chatMessages : [];
-    undoStack = Array.isArray(saved.undoStack) ? saved.undoStack : [];
-    clarificationContext = saved.clarificationContext || null;
-    canvasView = normalizeCanvasView(saved.canvasView || canvasView);
-    ensureGraphShape();
-    normalizeLayout();
+    if (isLegacyUntouchedSampleEnvelope(saved)) return;
+    applyEnvelopeToState(saved);
   } catch (error) {
     console.warn("Unable to load saved graph", error);
   }
 }
 
-function saveState() {
-  localStorage.setItem(
-    STORAGE_KEY,
-    JSON.stringify({
-      graph,
-      layout,
-      selected,
-      mutationLog,
-      openQuestions,
-      allowCycles,
-      addNodeFormOpen,
-      addEdgeFormOpen,
-      resourcesOpen,
-      constraintsOpen,
-      leftPanelCollapsed,
-      rightPanelCollapsed,
-      chatMessages,
-      undoStack,
-      clarificationContext,
-      canvasView,
-    })
+function isLegacyUntouchedSampleEnvelope(env) {
+  const savedGraph = env?.graph;
+  if (!savedGraph || savedGraph.id === CURRENT_SAMPLE_GRAPH_ID) return false;
+
+  const mutationEntries = readEnvelopeField(env, "mutation_log", "mutationLog", []);
+  const chatEntries = readEnvelopeField(env, "chat_messages", "chatMessages", []);
+  const openQuestionEntries = readEnvelopeField(env, "open_questions", "openQuestions", []);
+  const undoEntries = readEnvelopeField(env, "undo_stack", "undoStack", []);
+  const hasUserHistory = [mutationEntries, chatEntries, openQuestionEntries, undoEntries].some(
+    (entries) => Array.isArray(entries) && entries.length
   );
+  if (hasUserHistory) return false;
+
+  const legacyId = LEGACY_SAMPLE_GRAPH_IDS.includes(savedGraph.id);
+  const legacyName = LEGACY_SAMPLE_GRAPH_NAMES.includes(savedGraph.name);
+  const nodeNames = new Set((savedGraph.nodes || []).map((node) => String(node.name || "").toLowerCase()));
+  const invoiceDemo =
+    nodeNames.has("supplier invoice") &&
+    (nodeNames.has("match invoice") || nodeNames.has("resolve variance") || nodeNames.has("posted"));
+
+  return legacyId || legacyName || invoiceDemo;
+}
+
+// The full working-state envelope, snake_case on the wire (public contract).
+function serializeState() {
+  return {
+    graph,
+    layout,
+    selected,
+    mutation_log: mutationLog,
+    open_questions: openQuestions,
+    allow_cycles: allowCycles,
+    validate_current_view: validateCurrentView,
+    add_node_form_open: addNodeFormOpen,
+    left_panel_collapsed: leftPanelCollapsed,
+    legend_collapsed: legendCollapsed,
+    chat_messages: chatMessages,
+    undo_stack: undoStack,
+    clarification_context: clarificationContext,
+    canvas_view: canvasView,
+    active_filter: activeFilter,
+    active_view_id: activeViewId,
+  };
+}
+
+function saveState() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(serializeState()));
+}
+
+// --- Graph library (named save/load) ---------------------------------------
+
+function loadLibrary() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LIBRARY_KEY) || "null");
+    if (parsed && Array.isArray(parsed.graphs)) return parsed;
+  } catch (error) {
+    console.warn("Unable to load graph library", error);
+  }
+  return { graphs: [] };
+}
+
+function saveLibrary(library) {
+  localStorage.setItem(LIBRARY_KEY, JSON.stringify(library));
+}
+
+function libraryEntryId(name) {
+  return `lib_${slug(name) || "graph"}_${Date.now()}`;
+}
+
+function formatTimestamp(iso) {
+  if (!iso) return "unknown";
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? "unknown" : date.toLocaleString();
+}
+
+function saveCurrentToLibrary(name) {
+  const cleanName = (name || "").trim() || graph.name || "Untitled Process Graph";
+  graph.name = cleanName;
+  const library = loadLibrary();
+  const envelope = clone(serializeState());
+  const timestamp = new Date().toISOString();
+  const existing = library.graphs.find((entry) => entry.name.toLowerCase() === cleanName.toLowerCase());
+  if (existing) {
+    existing.envelope = envelope;
+    existing.updated_at = timestamp;
+    existing.node_count = graph.nodes.length;
+    existing.edge_count = graph.edges.length;
+  } else {
+    library.graphs.push({
+      id: libraryEntryId(cleanName),
+      name: cleanName,
+      saved_at: timestamp,
+      updated_at: timestamp,
+      node_count: graph.nodes.length,
+      edge_count: graph.edges.length,
+      envelope,
+    });
+  }
+  saveLibrary(library);
+  saveState();
+  renderLibrary();
+  closeSaveDialog();
+  toast(existing ? `Updated "${cleanName}" in library` : `Saved "${cleanName}" to library`);
+}
+
+function loadFromLibrary(entryId) {
+  const library = loadLibrary();
+  const entry = library.graphs.find((item) => item.id === entryId);
+  if (!entry || !entry.envelope) {
+    toast("Saved graph not found");
+    return;
+  }
+  // Clone so edits to the loaded graph never mutate the stored library entry.
+  applyEnvelopeToState(clone(entry.envelope));
+  clearCurrentFileHandle();
+  pendingPlan = null;
+  clarificationContext = null;
+  renderPlan();
+  render();
+  closeLibrary();
+  toast(`Loaded "${entry.name}"`);
+}
+
+function duplicateLibraryEntry(entryId) {
+  const library = loadLibrary();
+  const entry = library.graphs.find((item) => item.id === entryId);
+  if (!entry) return;
+  const copyName = `${entry.name} copy`;
+  const timestamp = new Date().toISOString();
+  library.graphs.push({
+    ...clone(entry),
+    id: libraryEntryId(copyName),
+    name: copyName,
+    saved_at: timestamp,
+    updated_at: timestamp,
+  });
+  saveLibrary(library);
+  renderLibrary();
+  toast(`Duplicated as "${copyName}"`);
+}
+
+function deleteLibraryEntry(entryId) {
+  const library = loadLibrary();
+  const entry = library.graphs.find((item) => item.id === entryId);
+  if (!entry) return;
+  if (!window.confirm(`Delete "${entry.name}" from the library? This cannot be undone.`)) return;
+  library.graphs = library.graphs.filter((item) => item.id !== entryId);
+  saveLibrary(library);
+  renderLibrary();
+  toast(`Deleted "${entry.name}"`);
+}
+
+function renderLibrary() {
+  if (!els.libraryList) return;
+  const library = loadLibrary();
+  const entries = [...library.graphs].sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
+  if (!entries.length) {
+    els.libraryList.innerHTML = `<div class="library-empty">No saved graphs yet. Use Save to add the current graph to the library.</div>`;
+    return;
+  }
+  els.libraryList.innerHTML = entries
+    .map((entry) => {
+      const nodeCount = entry.envelope?.graph?.nodes?.length ?? entry.node_count ?? 0;
+      const edgeCount = entry.envelope?.graph?.edges?.length ?? entry.edge_count ?? 0;
+      const updated = formatTimestamp(entry.updated_at || entry.saved_at);
+      return `
+        <div class="library-row" data-entry-id="${escapeAttribute(entry.id)}">
+          <div class="library-row-main">
+            <strong>${escapeHtml(entry.name)}</strong>
+            <span>${nodeCount} nodes · ${edgeCount} edges · ${escapeHtml(updated)}</span>
+          </div>
+          <div class="library-row-actions">
+            <button class="button secondary" type="button" data-library-action="load">Load</button>
+            <button class="button secondary" type="button" data-library-action="duplicate">Duplicate</button>
+            <button class="button secondary danger" type="button" data-library-action="delete">Delete</button>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function openLibrary() {
+  renderLibrary();
+  if (typeof els.libraryDialog.showModal === "function") {
+    els.libraryDialog.showModal();
+  } else {
+    els.libraryDialog.setAttribute("open", "");
+  }
+}
+
+function closeLibrary() {
+  if (typeof els.libraryDialog.close === "function") {
+    els.libraryDialog.close();
+  } else {
+    els.libraryDialog.removeAttribute("open");
+  }
+}
+
+function openSaveDialog() {
+  els.saveGraphName.value = graph.name || "";
+  updateFileAccessUi();
+  if (typeof els.saveDialog.showModal === "function") {
+    els.saveDialog.showModal();
+  } else {
+    els.saveDialog.setAttribute("open", "");
+  }
+}
+
+function closeSaveDialog() {
+  if (typeof els.saveDialog.close === "function") {
+    els.saveDialog.close();
+  } else {
+    els.saveDialog.removeAttribute("open");
+  }
+}
+
+// --- Element editor modal (P0-5) -------------------------------------------
+// Per-element (node/edge) editing opens in a modal on double-click. The editor
+// body physically contains #inspectorContent, so renderInspector() and the
+// delegated input/click handlers keep working unchanged.
+
+function handleCanvasDoubleClick(event) {
+  const nodeId = event.target.closest(".node-group")?.dataset.nodeId;
+  const edgeId = event.target.closest("[data-edge-id]")?.dataset.edgeId;
+  if (nodeId) {
+    selected = { kind: "node", id: nodeId };
+  } else if (edgeId) {
+    selected = { kind: "edge", id: edgeId };
+  } else {
+    return; // ignore double-click on empty canvas
+  }
+  render();
+  openElementEditor();
+}
+
+function openElementEditor() {
+  if (!selected.kind || !selected.id) return;
+  let title = "Edit element";
+  if (selected.kind === "node") {
+    const node = graph.nodes.find((item) => item.id === selected.id);
+    title = node ? `Node — ${node.name || node.id}` : "Edit node";
+  } else if (selected.kind === "edge") {
+    const edge = graph.edges.find((item) => item.id === selected.id);
+    title = edge ? `Edge — ${edge.id}` : "Edit edge";
+  }
+  els.elementEditorTitle.textContent = title;
+  renderInspector();
+  renderElementConstraints();
+  switchEditorTab("details");
+  if (typeof els.elementEditorDialog.showModal === "function") {
+    els.elementEditorDialog.showModal();
+  } else {
+    els.elementEditorDialog.setAttribute("open", "");
+  }
+}
+
+function switchEditorTab(name) {
+  document.querySelectorAll("[data-editor-tab]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.editorTab === name);
+  });
+  if (els.editorDetailsPanel) els.editorDetailsPanel.classList.toggle("is-active", name === "details");
+  if (els.editorConstraintsPanel) els.editorConstraintsPanel.classList.toggle("is-active", name === "constraints");
+  if (name === "constraints") renderElementConstraints();
+}
+
+function closeElementEditor() {
+  if (typeof els.elementEditorDialog.close === "function") {
+    els.elementEditorDialog.close();
+  } else {
+    els.elementEditorDialog.removeAttribute("open");
+  }
+}
+
+// --- Relocated graph-level dialogs (P0-5) ----------------------------------
+// Ontology and Validation moved off the removed right panel into topbar-opened
+// modals. Each dialog body holds the same content ids the render functions
+// target, so renderOntology / renderValidation keep working whether the dialog
+// is open or closed. (Constraints moved into the element editor modal instead.)
+
+function showDialog(dialog) {
+  if (typeof dialog.showModal === "function") {
+    dialog.showModal();
+  } else {
+    dialog.setAttribute("open", "");
+  }
+}
+
+function hideDialog(dialog) {
+  if (typeof dialog.close === "function") {
+    dialog.close();
+  } else {
+    dialog.removeAttribute("open");
+  }
+}
+
+function openOntologyDialog() {
+  renderOntology();
+  showDialog(els.ontologyDialog);
+}
+
+function closeOntologyDialog() {
+  hideDialog(els.ontologyDialog);
+}
+
+function openValidationDialog() {
+  renderValidation();
+  showDialog(els.validationDialog);
+}
+
+function closeValidationDialog() {
+  hideDialog(els.validationDialog);
+}
+
+// --- Subgraph views / quick filters (ephemeral) ----------------------------
+// A view is a pure filter over the canonical graph, resolved to visible id sets
+// at render time. Non-destructive: the graph is never mutated; out-of-view
+// elements are dimmed (focus mode), not removed.
+
+function createEmptyFilter() {
+  return { flow_kinds: [], edge_types: [], node_types: [], focus_selection: false, hops: 1 };
+}
+
+function normalizeFilter(filter) {
+  if (!filter || typeof filter !== "object") return createEmptyFilter();
+  return {
+    flow_kinds: Array.isArray(filter.flow_kinds) ? filter.flow_kinds.filter((k) => FLOW_KINDS.includes(k)) : [],
+    edge_types: Array.isArray(filter.edge_types) ? filter.edge_types.filter((k) => EDGE_TYPES.includes(k)) : [],
+    node_types: Array.isArray(filter.node_types) ? filter.node_types.filter((k) => NODE_TYPES.includes(k)) : [],
+    focus_selection: Boolean(filter.focus_selection),
+    hops: Number.isFinite(filter.hops) ? filter.hops : 1,
+  };
+}
+
+function filterIsActive(filter) {
+  return Boolean(
+    filter.flow_kinds.length || filter.edge_types.length || filter.node_types.length || filter.focus_selection
+  );
+}
+
+// BFS out from the current selection over edges (undirected) up to `hops`.
+function focusNeighborhood(graphRef, selectedRef, hops) {
+  const seeds = [];
+  if (selectedRef?.kind === "node") {
+    seeds.push(selectedRef.id);
+  } else if (selectedRef?.kind === "edge") {
+    const edge = graphRef.edges.find((item) => item.id === selectedRef.id);
+    if (edge) seeds.push(edge.from_node, edge.to_node);
+  }
+  const set = new Set(seeds);
+  let frontier = new Set(seeds);
+  for (let hop = 0; hop < hops && frontier.size; hop += 1) {
+    const next = new Set();
+    graphRef.edges.forEach((edge) => {
+      if (frontier.has(edge.from_node) && !set.has(edge.to_node)) next.add(edge.to_node);
+      if (frontier.has(edge.to_node) && !set.has(edge.from_node)) next.add(edge.from_node);
+    });
+    next.forEach((id) => set.add(id));
+    frontier = next;
+  }
+  return set;
+}
+
+// Pure: returns the visible node/edge id sets for a filter. Unit-testable and a
+// future move into graph-logic.js (see REFACTOR_PLAN.md Option A).
+function resolveView(graphRef, filter, selectedRef) {
+  const allNodeIds = new Set(graphRef.nodes.map((node) => node.id));
+  const allEdgeIds = new Set(graphRef.edges.map((edge) => edge.id));
+  if (!filterIsActive(filter)) {
+    return { nodeIds: allNodeIds, edgeIds: allEdgeIds, active: false };
+  }
+
+  const edgeFiltersActive = filter.flow_kinds.length > 0 || filter.edge_types.length > 0;
+  let focusSet = filter.focus_selection ? focusNeighborhood(graphRef, selectedRef, filter.hops || 1) : null;
+  if (focusSet && focusSet.size === 0) focusSet = null; // nothing selected -> focus inactive
+  const nodeById = new Map(graphRef.nodes.map((node) => [node.id, node]));
+  const nodeTypeOk = (node) => !filter.node_types.length || (node && filter.node_types.includes(node.type));
+  const focusOk = (id) => !focusSet || focusSet.has(id);
+
+  const edgeIds = new Set();
+  const endpointIds = new Set();
+  graphRef.edges.forEach((edge) => {
+    const flowOk = !filter.flow_kinds.length || (Array.isArray(edge.flows) && edge.flows.some((flow) => filter.flow_kinds.includes(flow.kind)));
+    const typeOk = !filter.edge_types.length || filter.edge_types.includes(edge.type);
+    const endpointsOk = !filter.node_types.length || (nodeTypeOk(nodeById.get(edge.from_node)) && nodeTypeOk(nodeById.get(edge.to_node)));
+    if (flowOk && typeOk && endpointsOk && focusOk(edge.from_node) && focusOk(edge.to_node)) {
+      edgeIds.add(edge.id);
+      endpointIds.add(edge.from_node);
+      endpointIds.add(edge.to_node);
+    }
+  });
+
+  const nodeIds = new Set();
+  graphRef.nodes.forEach((node) => {
+    if (!nodeTypeOk(node) || !focusOk(node.id)) return;
+    // When filtering by edges, only show nodes that participate in a visible edge.
+    if (edgeFiltersActive && !endpointIds.has(node.id)) return;
+    nodeIds.add(node.id);
+  });
+  endpointIds.forEach((id) => nodeIds.add(id));
+
+  return { nodeIds, edgeIds, active: true };
+}
+
+function describeFilter(filter) {
+  const parts = [];
+  if (filter.flow_kinds.length) parts.push(`${filter.flow_kinds.join("/")} flows`);
+  if (filter.edge_types.length) parts.push(`${filter.edge_types.join("/")} edges`);
+  if (filter.node_types.length) parts.push(`${filter.node_types.join("/")} nodes`);
+  if (filter.focus_selection) parts.push("focus on selection");
+  return parts.join(" + ") || "filtered";
+}
+
+// Applies dimming to the freshly-rendered canvas and refreshes the status pill.
+function renderView() {
+  const view = resolveView(graph, activeFilter, selected);
+  const svg = els.graphCanvas;
+  if (svg) {
+    svg.querySelectorAll(".node-group[data-node-id]").forEach((el) => {
+      el.classList.toggle("is-dimmed", view.active && !view.nodeIds.has(el.dataset.nodeId));
+    });
+    svg.querySelectorAll(".edge-group[data-edge-id]").forEach((el) => {
+      el.classList.toggle("is-dimmed", view.active && !view.edgeIds.has(el.dataset.edgeId));
+    });
+  }
+  renderViewStatus(view);
+  return view;
+}
+
+function renderViewStatus(view) {
+  if (!els.viewStatus) return;
+  if (!view.active) {
+    els.viewStatus.hidden = true;
+    els.viewStatus.innerHTML = "";
+    return;
+  }
+  els.viewStatus.hidden = false;
+  els.viewStatus.innerHTML =
+    `Viewing ${escapeHtml(describeFilter(activeFilter))} · ${view.nodeIds.size} of ${graph.nodes.length} nodes · ` +
+    `${view.edgeIds.size} of ${graph.edges.length} edges <button type="button" class="view-clear">Clear</button>`;
+}
+
+function viewChip(dim, value) {
+  const active = activeFilter[dim].includes(value);
+  return `<button type="button" class="view-chip${active ? " is-active" : ""}" data-view-dim="${dim}" data-view-value="${escapeAttribute(value)}">${escapeHtml(titleCase(value))}</button>`;
+}
+
+function renderViewControls() {
+  if (!els.viewFlowKindChips) return;
+  els.viewFlowKindChips.innerHTML = FLOW_KINDS.map((kind) => viewChip("flow_kinds", kind)).join("");
+  els.viewEdgeTypeChips.innerHTML = EDGE_TYPES.map((type) => viewChip("edge_types", type)).join("");
+  els.viewNodeTypeChips.innerHTML = NODE_TYPES.map((type) => viewChip("node_types", type)).join("");
+  els.viewFocusSelection.checked = activeFilter.focus_selection;
+}
+
+function applyFilterChange() {
+  renderViewControls();
+  renderView();
+  renderSavedViews();
+  // View scoping affects validation results; refresh so the panel + scope note track the filter.
+  if (validateCurrentView) renderValidation();
+  saveState();
+}
+
+function toggleViewFilter(dim, value) {
+  const list = activeFilter[dim];
+  const index = list.indexOf(value);
+  if (index >= 0) list.splice(index, 1);
+  else list.push(value);
+  // A direct chip edit no longer matches any saved view.
+  activeViewId = null;
+  applyFilterChange();
+}
+
+function toggleFocusSelection() {
+  activeFilter.focus_selection = !activeFilter.focus_selection;
+  activeViewId = null;
+  applyFilterChange();
+}
+
+function clearViewFilter() {
+  activeFilter = createEmptyFilter();
+  activeViewId = null;
+  applyFilterChange();
+}
+
+// --- Saved views (persistent, stored on graph.saved_views) -----------------
+// A saved view is { id, name, filter } where filter reuses the exact shape
+// createEmptyFilter() produces, so resolveView/normalizeFilter work unchanged.
+
+function normalizeSavedViews(views) {
+  if (!Array.isArray(views)) return [];
+  return views
+    .filter((view) => view && typeof view === "object")
+    .map((view) => ({
+      id: typeof view.id === "string" && view.id ? view.id : `view_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      name: typeof view.name === "string" && view.name.trim() ? view.name.trim() : "Untitled view",
+      filter: normalizeFilter(view.filter),
+    }));
+}
+
+function renderSavedViews() {
+  if (!els.savedViewsList) return;
+  const views = Array.isArray(graph.saved_views) ? graph.saved_views : [];
+  if (!views.length) {
+    els.savedViewsList.innerHTML = `<p class="saved-views-empty">No saved views yet. Apply a filter above, then save it.</p>`;
+    return;
+  }
+  els.savedViewsList.innerHTML = views
+    .map((view) => {
+      const isActive = view.id === activeViewId;
+      return (
+        `<div class="saved-view-row${isActive ? " is-active" : ""}" data-view-id="${escapeAttribute(view.id)}">` +
+        `<span class="saved-view-name" title="${escapeAttribute(view.name)}">${escapeHtml(view.name)}</span>` +
+        `<span class="saved-view-actions">` +
+        `<button type="button" class="button tiny" data-view-action="apply" data-view-id="${escapeAttribute(view.id)}">Apply</button>` +
+        `<button type="button" class="button tiny ghost" data-view-action="delete" data-view-id="${escapeAttribute(view.id)}">Delete</button>` +
+        `</span></div>`
+      );
+    })
+    .join("");
+}
+
+function saveCurrentView(name) {
+  if (!filterIsActive(activeFilter)) {
+    toast("Apply a filter first, then save it as a view");
+    return;
+  }
+  const cleanName = (name || "").trim() || `View ${graph.saved_views.length + 1}`;
+  const id = `view_${slug(cleanName) || "view"}_${Date.now()}`;
+  const view = { id, name: cleanName, filter: normalizeFilter(activeFilter) };
+  const existing = graph.saved_views.find((item) => item.name.toLowerCase() === cleanName.toLowerCase());
+  if (existing) {
+    existing.filter = view.filter;
+    activeViewId = existing.id;
+  } else {
+    graph.saved_views.push(view);
+    activeViewId = id;
+  }
+  if (els.savedViewNameInput) els.savedViewNameInput.value = "";
+  saveState();
+  renderSavedViews();
+  toast(existing ? `Updated view "${cleanName}"` : `Saved view "${cleanName}"`);
+}
+
+function applySavedView(id) {
+  const view = graph.saved_views.find((item) => item.id === id);
+  if (!view) return;
+  activeFilter = normalizeFilter(view.filter);
+  activeViewId = id;
+  renderViewControls();
+  renderView();
+  renderSavedViews();
+  if (validateCurrentView) renderValidation();
+  saveState();
+}
+
+function deleteSavedView(id) {
+  const view = graph.saved_views.find((item) => item.id === id);
+  if (!view) return;
+  if (!window.confirm(`Delete the saved view "${view.name}"? The graph itself is not changed.`)) return;
+  graph.saved_views = graph.saved_views.filter((item) => item.id !== id);
+  if (activeViewId === id) activeViewId = null;
+  saveState();
+  renderSavedViews();
+  toast(`Deleted view "${view.name}"`);
+}
+
+function openViewsPopover() {
+  renderViewControls();
+  renderSavedViews();
+  els.viewsPopover.hidden = false;
+  els.viewsButton.setAttribute("aria-expanded", "true");
+}
+
+function closeViewsPopover() {
+  els.viewsPopover.hidden = true;
+  els.viewsButton.setAttribute("aria-expanded", "false");
+}
+
+function toggleViewsPopover() {
+  if (els.viewsPopover.hidden) openViewsPopover();
+  else closeViewsPopover();
 }
 
 function ensureGraphShape() {
@@ -964,14 +1475,41 @@ function ensureGraphShape() {
   graph.metadata = graph.metadata || { created_by: "Unknown", created_at: new Date().toISOString(), tags: [] };
   graph.modeling_style = MODELING_STYLES.includes(graph.modeling_style) ? graph.modeling_style : "none";
   graph.ontology = mergeOntology(DEFAULT_ONTOLOGY, graph.ontology || {});
+  graph.saved_views = normalizeSavedViews(graph.saved_views);
+  // DS-2: authored objectives/budgets/notes (variables are derived, NOT stored).
+  graph.design_space = normalizeDesignSpace(graph.design_space);
 
   graph.nodes.forEach((node) => {
     node.inputs = Array.isArray(node.inputs) ? node.inputs : [];
     node.outputs = Array.isArray(node.outputs) ? node.outputs : [];
     node.resources_required = normalizeResourceRequirements(node.resources_required || []);
-    node.attributes = node.attributes || {};
+    // DS-1: preserve object-valued (quantitative parameter) attributes on load.
+    node.attributes = normalizePropertyStore(node.attributes);
+    // DS-5: variant tagging is optional; default adoption when a variant is set.
+    if (typeof node.variant_of === "string" && node.variant_of.trim()) {
+      node.variant_of = node.variant_of.trim();
+      node.adoption = normalizeAdoption(node.adoption);
+    } else {
+      delete node.variant_of;
+      if (node.adoption && typeof node.adoption === "object") {
+        node.adoption = normalizeAdoption(node.adoption);
+      } else {
+        delete node.adoption;
+      }
+    }
     node.description = typeof node.description === "string" ? node.description : "";
     node.description_status = normalizeNodeDescriptionStatus(node.description_status, node.description);
+    node.perspectives = normalizePerspectives(node.perspectives);
+    // Migrate the deprecated single `notes` field into a "Notes" perspective (back-compat).
+    if (typeof node.notes === "string" && node.notes.trim()) {
+      const hasNotesPerspective = node.perspectives.some((perspective) => perspective.label === "Notes");
+      if (!hasNotesPerspective) {
+        node.perspectives.push({ label: "Notes", text: node.notes });
+      }
+      node.notes = "";
+    } else {
+      node.notes = "";
+    }
     if (!node.description) {
       node.description = suggestNodeDescription(node, graph);
       node.description_status = "suggested";
@@ -980,18 +1518,131 @@ function ensureGraphShape() {
 
   graph.resources.forEach((resource) => {
     resource.attributes = resource.attributes || {};
+    resource.description = typeof resource.description === "string" ? resource.description : "";
+    resource.description_status = normalizeDefinitionStatus(resource.description_status, resource.description);
   });
 
   graph.edges = graph.edges.map((edge) => createEdge(edge));
 
   graph.constraints = graph.constraints.map((constraint) => {
     const next = createConstraint(constraint);
-    if (!next.fields.target) next.fields.target = inferConstraintTarget(next);
-    next.expression = constraintExpression(next);
+    if (typeof next.expression !== "string") next.expression = "";
+    // Back-compat: seed the free-text expression once from legacy structured fields
+    // so previously-saved/sample constraints don't render blank under the text model.
+    if (!next.expression.trim()) {
+      const seeded = legacyConstraintText(constraint);
+      if (seeded) next.expression = seeded;
+    }
+    // Owner association: each constraint belongs to a node/edge (fields.target).
+    // If missing or stale, best-effort resolve the owner from the expression text.
+    next.fields = next.fields || { target: "" };
+    const owner = next.fields.target;
+    const ownerValid = owner && (graph.nodes.some((n) => n.id === owner) || graph.edges.some((e) => e.id === owner));
+    if (!ownerValid) {
+      next.fields.target = resolveConstraintOwnerFromText(next.expression);
+    }
     return next;
   });
 
+  migrateResourcesToNodes();
+
   inferOntologyFromGraph({ silent: true });
+}
+
+// One-time, idempotent migration: legacy graphs stored resources in a side
+// catalog (graph.resources) plus per-node/edge resources_required lists. The new
+// model makes each resource a first-class "resource" node and represents
+// "X requires resource Y" as an allocation edge Y -> X (resource feeds the task)
+// carrying the quantity.
+//
+// Idempotency: resource nodes reuse the original resource id, so a resource is
+// only created when no node with that id exists. Allocation edges use a
+// deterministic id (e_alloc_<consumer>_<resource>) so re-runs never duplicate.
+// After migrating, graph.resources is cleared and every resources_required list
+// is reset to [] (tolerated in data, never re-generated).
+function migrateResourcesToNodes() {
+  const legacyResources = Array.isArray(graph.resources) ? graph.resources : [];
+  const hasLegacyRequirements =
+    graph.nodes.some((node) => Array.isArray(node.resources_required) && node.resources_required.length) ||
+    graph.edges.some((edge) => Array.isArray(edge.resources_required) && edge.resources_required.length);
+  if (!legacyResources.length && !hasLegacyRequirements) return;
+
+  const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
+  // Map old resource id -> resource-node id, and slug(name) -> resource-node id.
+  const idToNodeId = new Map();
+  const nameToNodeId = new Map();
+
+  legacyResources.forEach((resource) => {
+    if (!resource || typeof resource !== "object") return;
+    const targetId = resource.id || uniqueId(`r_${slug(resource.name || "resource")}`);
+    let resourceNode = nodeById.get(targetId);
+    if (!resourceNode) {
+      resourceNode = createNode({
+        id: targetId,
+        name: resource.name || "Resource",
+        type: "resource",
+        attributes: { kind: resource.type || "human", ...(resource.attributes || {}) },
+      });
+      graph.nodes.push(resourceNode);
+      nodeById.set(resourceNode.id, resourceNode);
+      if (!layout[resourceNode.id]) layout[resourceNode.id] = nextLayoutPoint();
+    }
+    if (resource.id) idToNodeId.set(resource.id, resourceNode.id);
+    if (resource.name) nameToNodeId.set(slug(resource.name), resourceNode.id);
+    nameToNodeId.set(slug(resourceNode.name), resourceNode.id);
+  });
+
+  // Resolve a requirement to a resource-node id by resource_id first, then name.
+  const resolveResourceNodeId = (requirement) => {
+    if (!requirement) return "";
+    if (requirement.resource_id && idToNodeId.has(requirement.resource_id)) {
+      return idToNodeId.get(requirement.resource_id);
+    }
+    // Tolerate a stale id that already points at an existing resource node.
+    if (requirement.resource_id && nodeById.get(requirement.resource_id)?.type === "resource") {
+      return requirement.resource_id;
+    }
+    const named = requirement.name ? nameToNodeId.get(slug(requirement.name)) : "";
+    return named || "";
+  };
+
+  graph.nodes.forEach((node) => {
+    const requirements = Array.isArray(node.resources_required) ? node.resources_required : [];
+    if (!requirements.length) return;
+    if (node.type === "resource") {
+      node.resources_required = [];
+      return;
+    }
+    requirements.forEach((requirement) => {
+      const resourceNodeId = resolveResourceNodeId(requirement);
+      if (!resourceNodeId) return; // skip unresolvable requirements
+      // Resources are inputs to the task: the allocation edge runs resource -> consumer.
+      const edgeId = `e_alloc_${slug(resourceNodeId)}_${slug(node.id)}`;
+      if (graph.edges.some((edge) => edge.id === edgeId)) return; // idempotent
+      const quantity = requirement.quantity !== undefined ? String(requirement.quantity) : "";
+      graph.edges.push(
+        createEdge({
+          id: edgeId,
+          from_node: resourceNodeId,
+          to_node: node.id,
+          type: "allocation",
+          condition: quantity ? `qty: ${quantity}` : "",
+          properties: quantity ? { quantity } : {},
+        })
+      );
+    });
+    node.resources_required = [];
+  });
+
+  // Edges cannot originate from an edge, so legacy edge-level requirements drop.
+  graph.edges.forEach((edge) => {
+    if (Array.isArray(edge.resources_required) && edge.resources_required.length) {
+      edge.resources_required = [];
+    }
+  });
+
+  // Catalog data has been migrated into resource nodes.
+  graph.resources = [];
 }
 
 function mergeOntology(base, custom) {
@@ -1088,16 +1739,12 @@ function render() {
   renderMinimap();
   updateCanvasControls();
   renderInspector();
-  renderEdgeBuilder();
-  renderEdgeTypeHelp();
-  renderEdgeFlowKindHelp();
   renderValidation();
-  renderResources();
-  renderConstraints();
   renderOntology();
   renderLog();
   renderUndoState();
   updateStatus();
+  updateFileAccessUi();
   saveState();
 }
 
@@ -1130,9 +1777,13 @@ async function requestBackendAssist(message) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ graph_id: graph.id, user_message: message }),
     });
-    if (!response.ok) return null;
+    if (!response.ok) {
+      notifyBackendFailure(`Backend assist failed (status ${response.status}). Using the local planner instead.`);
+      return null;
+    }
     return await response.json();
   } catch {
+    notifyBackendFailure("Could not reach the backend for assist. Using the local planner instead.");
     return null;
   }
 }
@@ -1141,14 +1792,47 @@ async function syncBackendMutations(mutations) {
   const base = apiBase();
   if (!base || !mutations.length) return;
   try {
-    await fetch(`${base}/graph/mutate`, {
+    const response = await fetch(`${base}/graph/mutate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ graph_id: graph.id, mutations }),
     });
+    if (!response.ok) {
+      notifyBackendSyncFailure(`Backend sync failed (status ${response.status}). Your changes are saved locally.`);
+    }
   } catch {
-    // Local authoring remains the source of truth when backend sync is unavailable.
+    notifyBackendSyncFailure("Could not reach the backend to sync. Your changes are saved locally.");
   }
+}
+
+// Surfaces an assist-time backend failure without blocking: a transient toast
+// plus a chat warning, since assist results land in the chat. Local planning
+// stays authoritative (the caller still falls back to the local compiler).
+function notifyBackendFailure(text) {
+  toast(text);
+  appendChatMessage("assistant", {
+    summary: "Backend unavailable",
+    detail: "I planned this with the local compiler instead.",
+    questions: [],
+    warnings: [text],
+  });
+}
+
+// Surfaces a sync-time backend failure without blocking. Mutations are already
+// applied locally, so we record the failure in the mutation audit log (where
+// graph changes are tracked) and show a transient toast.
+function notifyBackendSyncFailure(text) {
+  toast(text);
+  mutationLog.push({
+    action: "backend_sync_failed",
+    target_id: null,
+    payload: {},
+    reason: text,
+    confidence: "n/a",
+    timestamp: new Date().toISOString(),
+  });
+  renderLog();
+  saveState();
 }
 
 function apiBase() {
@@ -1325,31 +2009,13 @@ function renderChatMessage(message) {
 
 function renderPanelCollapse() {
   els.workspace.classList.toggle("left-collapsed", leftPanelCollapsed);
-  els.workspace.classList.toggle("right-collapsed", rightPanelCollapsed);
   els.leftPanel.classList.toggle("is-collapsed", leftPanelCollapsed);
-  els.rightPanel.classList.toggle("is-collapsed", rightPanelCollapsed);
   els.toggleLeftPanelButton.setAttribute("aria-expanded", String(!leftPanelCollapsed));
-  els.toggleRightPanelButton.setAttribute("aria-expanded", String(!rightPanelCollapsed));
   els.toggleLeftPanelButton.title = leftPanelCollapsed ? "Expand left panel" : "Collapse left panel";
-  els.toggleRightPanelButton.title = rightPanelCollapsed ? "Expand right panel" : "Collapse right panel";
   els.toggleLeftPanelButton.setAttribute("aria-label", leftPanelCollapsed ? "Expand left menu" : "Collapse left menu");
-  els.toggleRightPanelButton.setAttribute("aria-label", rightPanelCollapsed ? "Expand right inspector" : "Collapse right inspector");
   els.toggleLeftPanelButton.innerHTML = leftPanelCollapsed
     ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>`
     : `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 6-6 6 6 6" /></svg>`;
-  els.toggleRightPanelButton.innerHTML = rightPanelCollapsed
-    ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 6-6 6 6 6" /></svg>`
-    : `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>`;
-}
-
-function toggleRightPanel() {
-  rightPanelCollapsed = !rightPanelCollapsed;
-  renderPanelCollapse();
-  requestAnimationFrame(() => {
-    renderCanvas();
-    renderMinimap();
-  });
-  saveState();
 }
 
 function buildPendingCanvasPreview() {
@@ -1431,18 +2097,45 @@ function renderNotationLegend() {
     .map((reference) => `<a href="${escapeAttribute(reference.url)}" target="_blank" rel="noreferrer">${escapeHtml(reference.label)}</a>`)
     .join(", ");
 
-  els.notationLegend.innerHTML = `
-    <div class="legend-heading">
-      <strong>${escapeHtml(profile.shortLabel || profile.label)}</strong>
-      <span>${escapeHtml(profile.label)}</span>
+  els.notationLegend.classList.toggle("is-collapsed", legendCollapsed);
+
+  const headerBar = `
+    <div class="legend-bar">
+      <span class="legend-bar-label">${escapeHtml("Legend")}</span>
+      <button class="icon-button" id="legendToggleButton" type="button"
+        title="${legendCollapsed ? "Expand legend" : "Collapse legend"}"
+        aria-label="${legendCollapsed ? "Expand legend" : "Collapse legend"}"
+        aria-expanded="${legendCollapsed ? "false" : "true"}">
+        <svg class="legend-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
+      </button>
     </div>
-    <p>${escapeHtml(profile.summary)}</p>
-    <div class="legend-grid">
-      ${profile.nodeLegend.slice(0, 4).map(([label, detail]) => renderLegendRow("node", label, detail)).join("")}
-      ${profile.edgeLegend.slice(0, 3).map(([label, detail]) => renderLegendRow("edge", label, detail)).join("")}
-    </div>
-    ${references ? `<div class="legend-refs">Grounded in ${references}</div>` : `<div class="legend-refs">Canonical graph notation</div>`}
   `;
+
+  const body = legendCollapsed ? "" : `
+    <div class="legend-body">
+      <div class="legend-heading">
+        <strong>${escapeHtml(profile.shortLabel || profile.label)}</strong>
+        <span>${escapeHtml(profile.label)}</span>
+      </div>
+      <p>${escapeHtml(profile.summary)}</p>
+      <div class="legend-grid">
+        ${profile.nodeLegend.slice(0, 4).map(([label, detail]) => renderLegendRow("node", label, detail)).join("")}
+        ${profile.edgeLegend.slice(0, 3).map(([label, detail]) => renderLegendRow("edge", label, detail)).join("")}
+      </div>
+      ${references ? `<div class="legend-refs">Grounded in ${references}</div>` : `<div class="legend-refs">Canonical graph notation</div>`}
+    </div>
+  `;
+
+  els.notationLegend.innerHTML = headerBar + body;
+  // The toggle button is re-created on each render; re-cache the current element.
+  // The click is handled via delegation on #notationLegend in bindEvents().
+  els.legendToggleButton = document.getElementById("legendToggleButton");
+}
+
+function toggleLegendCollapsed() {
+  legendCollapsed = !legendCollapsed;
+  renderNotationLegend();
+  saveState();
 }
 
 function renderMinimap() {
@@ -1566,6 +2259,7 @@ function renderCanvas() {
   `;
   renderMinimap();
   updateCanvasControls();
+  renderView();
 }
 
 function renderPreviewMarkup(preview) {
@@ -1616,6 +2310,19 @@ function renderNode(node, options = {}) {
 function renderNodeShape(node, size, fill, profile) {
   const style = graph.modeling_style || "none";
   const stroke = "rgba(16,24,32,0.2)";
+
+  // Resource definitions render as a cylinder ("database") in every notation
+  // profile so they read clearly as a resource the graph allocates against.
+  if (node.type === "resource") {
+    const w = size.w;
+    const h = size.h;
+    const ry = Math.min(12, h * 0.16);
+    return (
+      `<path class="node-shape" d="M 0 ${ry} C 0 ${ry * 0.2}, ${w} ${ry * 0.2}, ${w} ${ry} L ${w} ${h - ry} C ${w} ${h - ry * 0.2}, 0 ${h - ry * 0.2}, 0 ${h - ry} Z" fill="${fill}" stroke="rgba(16,24,32,0.22)" />` +
+      `<path class="node-shape-detail" d="M 0 ${ry} C 0 ${ry * 1.8}, ${w} ${ry * 1.8}, ${w} ${ry}" />`
+    );
+  }
+
   if (style === "business_process") {
     if (node.type === "source" || node.type === "sink") {
       const width = node.type === "sink" ? 4 : 2;
@@ -1735,7 +2442,7 @@ function renderEdge(edge, options = {}) {
 
   return `
     <g class="edge-group notation-${escapeAttribute(graph.modeling_style || "none")}${selectedClass}${previewClass}" ${dataAttr}>
-      ${options.preview ? "" : `<path class="edge-hit" d="${path}" data-edge-id="${edge.id}" />`}
+      ${options.preview ? "" : `<path class="edge-hit" d="${path}" data-edge-id="${escapeAttribute(edge.id)}" />`}
       <path class="edge-path ${edge.type} ${visual.flowClass}" d="${path}" marker-end="${marker}" style="${visual.style}" />
       ${
         showLabel
@@ -1747,9 +2454,25 @@ function renderEdge(edge, options = {}) {
   `;
 }
 
+// P0-4: when a filter is active and the selected object is hidden by the view,
+// return a small notice with a "Show full graph" button; otherwise an empty string.
+function outsideViewNotice(kind, id) {
+  if (!filterIsActive(activeFilter)) return "";
+  const view = resolveView(graph, activeFilter, selected);
+  if (!view.active) return "";
+  const visible = kind === "edge" ? view.edgeIds.has(id) : view.nodeIds.has(id);
+  if (visible) return "";
+  const label = kind === "edge" ? "edge" : "node";
+  return `
+    <div class="outside-view-notice">
+      <span>This ${escapeHtml(label)} is outside the current view.</span>
+      <button class="button tiny" type="button" data-show-full-graph>Show full graph</button>
+    </div>
+  `;
+}
+
 function renderInspector() {
   if (!selected.kind || !selected.id) {
-    els.inspectorSubhead.textContent = "No canvas object selected";
     els.inspectorContent.innerHTML = renderEmptyInspector();
     return;
   }
@@ -1761,9 +2484,12 @@ function renderInspector() {
       renderInspector();
       return;
     }
-    els.inspectorSubhead.textContent = edge.id;
     const flowRows = renderEdgeFlowEditor(edge);
+    const edgePerspectiveRows = renderPerspectivesEditor(edge, "edge");
+    const edgePropertyRows = renderPropertiesEditor(edge, "edge");
+    const edgeDefinitionStatus = normalizeDefinitionStatus(edge.description_status, edge.description);
     els.inspectorContent.innerHTML = `
+      ${outsideViewNotice("edge", edge.id)}
       <h3>Edge Properties</h3>
       <label class="field">
         <span>ID</span>
@@ -1788,6 +2514,22 @@ function renderInspector() {
         <span>Condition</span>
         <input type="text" data-edge-field="condition" value="${escapeAttribute(edge.condition || "")}" placeholder="Optional" />
       </label>
+      <div class="field definition-field">
+        <div class="section-title">
+          <span>Definition</span>
+          <span class="definition-status ${escapeAttribute(edgeDefinitionStatus)}">${escapeHtml(definitionStatusLabel(edgeDefinitionStatus))}</span>
+        </div>
+        <textarea rows="3" data-edge-field="description" placeholder="Explain what this edge represents">${escapeHtml(edge.description || "")}</textarea>
+      </div>
+      <div class="field">
+        <div class="section-title">
+          <span>Perspectives</span>
+          <button class="icon-button" type="button" title="Add perspective" data-add-perspective="edge">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+          </button>
+        </div>
+        <div class="list-editor">${edgePerspectiveRows}</div>
+      </div>
       <div class="field">
         <div class="section-title">
           <span>Flows Carried</span>
@@ -1797,6 +2539,16 @@ function renderInspector() {
         </div>
         <div class="list-editor">${flowRows}</div>
       </div>
+      <div class="field">
+        <div class="section-title">
+          <span>Properties</span>
+          <button class="icon-button" type="button" title="Add property" data-add-prop="edge">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+          </button>
+        </div>
+        <div class="list-editor">${edgePropertyRows}</div>
+      </div>
+      ${renderEdgeChangeEditor(edge)}
       <button class="button secondary full" type="button" data-delete-edge="${edge.id}">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18" /><path d="M8 6V4h8v2" /><path d="M19 6l-1 14H6L5 6" /></svg>
         Delete Edge
@@ -1807,20 +2559,20 @@ function renderInspector() {
 
   const node = graph.nodes.find((item) => item.id === selected.id) || graph.nodes[0];
   if (!node) {
-    els.inspectorSubhead.textContent = "No object selected";
     els.inspectorContent.innerHTML = renderEmptyInspector();
     return;
   }
 
   selected = { kind: "node", id: node.id };
-  els.inspectorSubhead.textContent = node.id;
   const inputRows = renderStringListEditor("inputs", node.inputs);
   const outputRows = renderStringListEditor("outputs", node.outputs);
-  const resourceRows = renderResourceRequirementEditor(node);
+  const perspectiveRows = renderPerspectivesEditor(node, "node");
+  const propertyRows = renderPropertiesEditor(node, "node");
   const definitionStatus = normalizeNodeDescriptionStatus(node.description_status, node.description);
   const definitionApproved = definitionStatus === "approved";
 
   els.inspectorContent.innerHTML = `
+    ${outsideViewNotice("node", node.id)}
     <h3>Node Properties</h3>
     <label class="field">
       <span>Name</span>
@@ -1851,6 +2603,15 @@ function renderInspector() {
     </div>
     <div class="field">
       <div class="section-title">
+        <span>Perspectives</span>
+        <button class="icon-button" type="button" title="Add perspective" data-add-perspective="node">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+        </button>
+      </div>
+      <div class="list-editor">${perspectiveRows}</div>
+    </div>
+    <div class="field">
+      <div class="section-title">
         <span>Inputs</span>
         <button class="icon-button" type="button" title="Add input" data-add-io="inputs">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
@@ -1867,19 +2628,16 @@ function renderInspector() {
       </div>
       <div class="list-editor">${outputRows}</div>
     </div>
-    <label class="field">
-      <span>Notes</span>
-      <textarea rows="4" data-node-field="notes">${escapeHtml(node.notes || "")}</textarea>
-    </label>
     <div class="field">
       <div class="section-title">
-        <span>Resources Required</span>
-        <button class="icon-button" type="button" title="Add resource requirement" data-add-resource-req>
+        <span>Properties</span>
+        <button class="icon-button" type="button" title="Add property" data-add-prop="node">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
         </button>
       </div>
-      <div class="list-editor">${resourceRows}</div>
+      <div class="list-editor">${propertyRows}</div>
     </div>
+    ${renderNodeVariantEditor(node)}
     <button class="button secondary full" type="button" data-delete-node="${node.id}">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18" /><path d="M8 6V4h8v2" /><path d="M19 6l-1 14H6L5 6" /></svg>
       Delete Node
@@ -1895,10 +2653,6 @@ function renderEmptyInspector() {
       <button class="button primary" type="button" data-toggle-add-node-form>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
         Add Node
-      </button>
-      <button class="button secondary" type="button" data-toggle-add-edge-form>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14" /><path d="m13 6 6 6-6 6" /></svg>
-        Add Edge
       </button>
     </div>
     ${
@@ -1942,29 +2696,247 @@ function renderStringListEditor(field, values) {
     : `<div class="type-help">No ${field} defined yet.</div>`;
 }
 
-function renderResourceRequirementEditor(node) {
-  const requirements = node.resources_required || [];
-  return requirements.length
-    ? requirements
-        .map(
-          (requirement, index) => `
-            <div class="resource-requirement-row">
-              <label class="field">
-                <span>Name</span>
-                <input list="resourceNameOptions" type="text" data-resource-req-field="name" data-resource-req-index="${index}" value="${escapeAttribute(requirement.name || resourceName(requirement.resource_id))}" />
+// Reusable properties (free-form key/value) editor. `target` is "node" (edits
+// obj.attributes) or "edge" (edits obj.properties). Rows render the object as
+// snake_case key + string value pairs; the handler rebuilds the whole object
+// from all rows on every edit. Built so a later modal pass can re-host it unchanged.
+function renderPropertiesEditor(obj, target) {
+  const store = target === "edge" ? obj.properties : obj.attributes;
+  const entries = Object.entries(store || {});
+  const rows = entries
+    .map(([key, value], index) => renderPropertyRow(target, index, key, value))
+    .join("");
+  return entries.length ? rows : `<div class="type-help">No properties yet. Add snake_case key/value rows as needed.</div>`;
+}
+
+// DS-1 KEYSTONE. Each property row keeps key + string value by default plus a
+// "ƒ" toggle that promotes the value to a quantitative parameter object
+// { value, unit, uncertainty?, variable? }. Promotion/demotion re-renders the
+// inspector so the parameter sub-inputs appear/disappear; all other edits
+// rebuild the store from the DOM (see collectPropertyStore).
+function renderPropertyRow(target, index, key, value) {
+  const promoted = isParameterValue(value);
+  const param = promoted ? normalizeParameter(value) : null;
+  const stringValue = promoted ? "" : String(value ?? "");
+  const toggle = `
+    <button class="icon-button param-toggle ${promoted ? "is-active" : ""}" type="button"
+      title="${promoted ? "Revert to plain text value" : "Promote to a quantitative parameter"}"
+      data-prop-target="${target}" data-prop-index="${index}" data-prop-toggle="parameter" aria-pressed="${promoted ? "true" : "false"}">ƒ</button>`;
+  const valueInput = promoted
+    ? `<input type="text" data-prop-target="${target}" data-prop-index="${index}" data-prop-part="value" value="${escapeAttribute(param.value)}" placeholder="number" />`
+    : `<input type="text" data-prop-target="${target}" data-prop-index="${index}" data-prop-part="value" value="${escapeAttribute(stringValue)}" placeholder="value" />`;
+  const head = `
+    <div class="property-row">
+      <label class="field">
+        <span>Key</span>
+        <input type="text" data-prop-target="${target}" data-prop-index="${index}" data-prop-part="key" value="${escapeAttribute(key)}" placeholder="snake_case_key" />
+      </label>
+      <label class="field">
+        <span>${promoted ? "Value" : "Value"}</span>
+        ${valueInput}
+      </label>
+      <div class="property-row-tools">
+        ${toggle}
+        <button class="icon-button danger" type="button" title="Remove property" data-remove-prop="${index}" data-prop-target="${target}">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18" /><path d="M8 6V4h8v2" /><path d="M19 6l-1 14H6L5 6" /></svg>
+        </button>
+      </div>
+    </div>`;
+  if (!promoted) return head;
+  return head + renderParameterEditor(target, index, param);
+}
+
+// Compact parameter sub-editor: unit + uncertainty mini-editor (kind select +
+// relevant fields) + a "variable" toggle revealing the decision-domain inputs.
+function renderParameterEditor(target, index, param) {
+  const base = { target, index };
+  const unc = param.uncertainty || null;
+  const uncKind = unc ? unc.kind : "";
+  const variable = param.variable || null;
+  const dp = (part) => `data-prop-target="${target}" data-prop-index="${index}" data-prop-field="${part}"`;
+
+  const uncFields = (() => {
+    if (!unc) return "";
+    if (uncKind === "range") {
+      return `
+        <label class="field"><span>Low</span><input type="text" ${dp("unc_low")} value="${escapeAttribute(unc.low ?? "")}" placeholder="low" /></label>
+        <label class="field"><span>High</span><input type="text" ${dp("unc_high")} value="${escapeAttribute(unc.high ?? "")}" placeholder="high" /></label>`;
+    }
+    if (uncKind === "plus_minus") {
+      return `
+        <label class="field"><span>± amount</span><input type="text" ${dp("unc_plus_minus")} value="${escapeAttribute(unc.plus_minus ?? "")}" placeholder="±" /></label>
+        <label class="checkbox-field param-percent"><input type="checkbox" ${dp("unc_percent")} ${unc.percent ? "checked" : ""} /><span>percent</span></label>`;
+    }
+    if (uncKind === "confidence") {
+      return `
+        <label class="field"><span>Confidence</span><input type="text" ${dp("unc_confidence")} value="${escapeAttribute(unc.confidence ?? "")}" placeholder="e.g. 95%" /></label>
+        <label class="field"><span>Low</span><input type="text" ${dp("unc_low")} value="${escapeAttribute(unc.low ?? "")}" placeholder="low" /></label>
+        <label class="field"><span>High</span><input type="text" ${dp("unc_high")} value="${escapeAttribute(unc.high ?? "")}" placeholder="high" /></label>`;
+    }
+    if (uncKind === "distribution") {
+      return `
+        <label class="field"><span>Distribution</span><input type="text" ${dp("unc_distribution")} value="${escapeAttribute(unc.distribution ?? "")}" placeholder="e.g. normal" /></label>
+        <label class="field"><span>Mean</span><input type="text" ${dp("unc_mean")} value="${escapeAttribute(unc.mean ?? "")}" placeholder="mean" /></label>
+        <label class="field"><span>Std</span><input type="text" ${dp("unc_std")} value="${escapeAttribute(unc.std ?? "")}" placeholder="std" /></label>`;
+    }
+    return "";
+  })();
+
+  const variableFields = (() => {
+    if (!variable) return "";
+    if (variable.kind === "range") {
+      return `
+        <label class="field"><span>Min</span><input type="text" ${dp("var_min")} value="${escapeAttribute(variable.min ?? "")}" placeholder="min" /></label>
+        <label class="field"><span>Max</span><input type="text" ${dp("var_max")} value="${escapeAttribute(variable.max ?? "")}" placeholder="max" /></label>
+        <label class="field"><span>Step</span><input type="text" ${dp("var_step")} value="${escapeAttribute(variable.step ?? "")}" placeholder="step" /></label>
+        <label class="field"><span>Unit</span><input type="text" ${dp("var_unit")} value="${escapeAttribute(variable.unit ?? "")}" placeholder="unit" /></label>`;
+    }
+    if (variable.kind === "enum") {
+      return `
+        <label class="field param-enum"><span>Options (comma-separated)</span><input type="text" ${dp("var_options")} value="${escapeAttribute((variable.options || []).join(", "))}" placeholder="a, b, c" /></label>`;
+    }
+    return `<div class="type-help param-help">Boolean domain: the search chooses true or false.</div>`;
+  })();
+
+  return `
+    <div class="param-editor">
+      <div class="param-row">
+        <label class="field"><span>Unit</span><input type="text" ${dp("unit")} value="${escapeAttribute(param.unit ?? "")}" placeholder="e.g. s, USD, kg" /></label>
+        <label class="field"><span>Uncertainty</span>
+          <select ${dp("unc_kind")}>
+            <option value=""${uncKind === "" ? " selected" : ""}>— none —</option>
+            ${UNCERTAINTY_KINDS.map((k) => `<option value="${k}"${uncKind === k ? " selected" : ""}>${titleCase(k)}</option>`).join("")}
+          </select>
+        </label>
+      </div>
+      ${uncFields ? `<div class="param-row param-unc-fields">${uncFields}</div>` : ""}
+      <label class="checkbox-field param-variable-toggle">
+        <input type="checkbox" ${dp("variable_on")} ${variable ? "checked" : ""} />
+        <span>Decision variable (the external search chooses from this domain)</span>
+      </label>
+      ${
+        variable
+          ? `<div class="param-row param-variable-fields">
+              <label class="field"><span>Domain</span>
+                <select ${dp("var_kind")}>
+                  ${VARIABLE_KINDS.map((k) => `<option value="${k}"${variable.kind === k ? " selected" : ""}>${titleCase(k)}</option>`).join("")}
+                </select>
               </label>
-              <label class="field">
-                <span>Qty</span>
-                <input type="text" data-resource-req-field="quantity" data-resource-req-index="${index}" value="${escapeAttribute(requirement.quantity || "")}" />
-              </label>
-              <button class="icon-button danger" type="button" title="Remove requirement" data-remove-resource-req="${index}">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18" /><path d="M8 6V4h8v2" /><path d="M19 6l-1 14H6L5 6" /></svg>
-              </button>
-            </div>
-          `
-        )
-        .join("") + `<datalist id="resourceNameOptions">${graph.resources.map((resource) => `<option value="${escapeAttribute(resource.name)}"></option>`).join("")}</datalist>`
-    : `<div class="type-help">No resource requirements. Add name + quantity rows as needed.</div>`;
+              ${variableFields}
+            </div>`
+          : ""
+      }
+    </div>`;
+}
+
+// DS-1. Rebuild a property store from all rows in the inspector for `target`
+// ("node" -> attributes, "edge" -> properties). Plain rows produce a string
+// value; promoted rows (a "ƒ" toggle with aria-pressed=true) produce a
+// quantitative parameter object assembled from the data-prop-field inputs.
+function collectPropertyStore(target) {
+  const byIndex = {};
+  const ensure = (index) => {
+    byIndex[index] = byIndex[index] || { key: "", value: "", promoted: false, fields: {} };
+    return byIndex[index];
+  };
+  els.inspectorContent
+    .querySelectorAll(`[data-prop-target="${target}"][data-prop-part]`)
+    .forEach((input) => {
+      const row = ensure(input.dataset.propIndex);
+      row[input.dataset.propPart] = input.value;
+    });
+  els.inspectorContent
+    .querySelectorAll(`[data-prop-target="${target}"][data-prop-toggle="parameter"]`)
+    .forEach((button) => {
+      ensure(button.dataset.propIndex).promoted = button.getAttribute("aria-pressed") === "true";
+    });
+  els.inspectorContent
+    .querySelectorAll(`[data-prop-target="${target}"][data-prop-field]`)
+    .forEach((input) => {
+      const row = ensure(input.dataset.propIndex);
+      const val = input.type === "checkbox" ? input.checked : input.value;
+      row.fields[input.dataset.propField] = val;
+    });
+
+  const store = {};
+  Object.values(byIndex).forEach((row) => {
+    const key = (row.key || "").trim();
+    if (!key) return;
+    store[key] = row.promoted ? buildParameterFromFields(row.value, row.fields) : row.value;
+  });
+  return store;
+}
+
+// Assemble a quantitative parameter object from the flat field map produced by
+// the parameter sub-editor. Empty/blank fields are dropped by normalizeParameter.
+function buildParameterFromFields(value, fields) {
+  const f = fields || {};
+  const param = { value };
+  if (f.unit !== undefined) param.unit = f.unit;
+  const uncKind = f.unc_kind || "";
+  if (uncKind) {
+    const unc = { kind: uncKind };
+    if (uncKind === "range") {
+      unc.low = f.unc_low;
+      unc.high = f.unc_high;
+    } else if (uncKind === "plus_minus") {
+      unc.plus_minus = f.unc_plus_minus;
+      unc.percent = Boolean(f.unc_percent);
+    } else if (uncKind === "confidence") {
+      unc.confidence = f.unc_confidence;
+      unc.low = f.unc_low;
+      unc.high = f.unc_high;
+    } else if (uncKind === "distribution") {
+      unc.distribution = f.unc_distribution;
+      unc.mean = f.unc_mean;
+      unc.std = f.unc_std;
+    }
+    param.uncertainty = unc;
+  }
+  if (f.variable_on) {
+    const varKind = f.var_kind || "range";
+    const variable = { kind: varKind };
+    if (varKind === "range") {
+      variable.min = f.var_min;
+      variable.max = f.var_max;
+      variable.step = f.var_step;
+      variable.unit = f.var_unit;
+    } else if (varKind === "enum") {
+      variable.options = String(f.var_options || "")
+        .split(",")
+        .map((opt) => opt.trim())
+        .filter(Boolean);
+    }
+    param.variable = variable;
+  }
+  return normalizeParameter(param);
+}
+
+// Reusable perspectives editor. Renders obj.perspectives as labeled blocks
+// ({ label, text }); the handler rebuilds the list from all rows. `target` is
+// "node" or "edge"; commits via update_node / update_edge.
+function renderPerspectivesEditor(obj, target) {
+  const perspectives = Array.isArray(obj.perspectives) ? obj.perspectives : [];
+  const rows = perspectives
+    .map(
+      (perspective, index) => `
+        <div class="perspective-row">
+          <label class="field">
+            <span>Label</span>
+            <input type="text" data-perspective-target="${target}" data-perspective-index="${index}" data-perspective-part="label" value="${escapeAttribute(perspective.label || "")}" placeholder="e.g. Finance view" />
+          </label>
+          <label class="field">
+            <span>Text</span>
+            <textarea rows="2" data-perspective-target="${target}" data-perspective-index="${index}" data-perspective-part="text" placeholder="How this object looks from this perspective">${escapeHtml(perspective.text || "")}</textarea>
+          </label>
+          <button class="icon-button danger" type="button" title="Remove perspective" data-remove-perspective="${index}" data-perspective-target="${target}">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18" /><path d="M8 6V4h8v2" /><path d="M19 6l-1 14H6L5 6" /></svg>
+          </button>
+        </div>
+      `
+    )
+    .join("");
+  return perspectives.length ? rows : `<div class="type-help">No perspectives yet. Add labeled description blocks as needed.</div>`;
 }
 
 function renderEdgeFlowEditor(edge) {
@@ -1993,6 +2965,14 @@ function renderEdgeFlowEditor(edge) {
               <button class="icon-button danger" type="button" title="Remove edge flow" data-remove-edge-flow="${index}">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18" /><path d="M8 6V4h8v2" /><path d="M19 6l-1 14H6L5 6" /></svg>
               </button>
+              <div class="flow-econ">
+                <span class="flow-econ-label">Value</span>
+                <input type="text" class="flow-econ-value" data-edge-flow-field="value_value" data-edge-flow-index="${index}" value="${escapeAttribute(flow.value?.value ?? "")}" placeholder="amount" aria-label="Flow value amount" />
+                <input type="text" class="flow-econ-unit" data-edge-flow-field="value_unit" data-edge-flow-index="${index}" value="${escapeAttribute(flow.value?.unit ?? "")}" placeholder="unit" aria-label="Flow value unit" />
+                <span class="flow-econ-label">Cost</span>
+                <input type="text" class="flow-econ-value" data-edge-flow-field="cost_value" data-edge-flow-index="${index}" value="${escapeAttribute(flow.cost?.value ?? "")}" placeholder="amount" aria-label="Flow cost amount" />
+                <input type="text" class="flow-econ-unit" data-edge-flow-field="cost_unit" data-edge-flow-index="${index}" value="${escapeAttribute(flow.cost?.unit ?? "")}" placeholder="unit" aria-label="Flow cost unit" />
+              </div>
             </div>
           `
         )
@@ -2000,28 +2980,71 @@ function renderEdgeFlowEditor(edge) {
     : `<div class="type-help">No flows defined yet. Add cash, energy, parts, information, data, work, approval, or custom flows.</div>`;
 }
 
-function renderEdgeBuilder() {
-  const fromDefault = selected.kind === "node" ? selected.id : graph.nodes[0]?.id || "";
-  const toDefault = graph.nodes.find((node) => node.id !== fromDefault)?.id || graph.nodes[0]?.id || "";
-  const fromValue = selected.kind === "node" ? fromDefault : els.edgeFromSelect.value || fromDefault;
-  els.edgeBuilderBody.style.display = addEdgeFormOpen ? "grid" : "none";
-  els.toggleAddEdgeButton.title = addEdgeFormOpen ? "Hide add edge form" : "Show add edge form";
-  els.edgeFromSelect.innerHTML = nodeOptions(fromValue);
-  els.edgeToSelect.innerHTML = nodeOptions(els.edgeToSelect.value || toDefault);
-  els.edgeTypeSelect.innerHTML = EDGE_TYPES.map((type) => option(type, els.edgeTypeSelect.value || "flow", ontologyLabel("edge_types", type))).join("");
-  els.edgeFlowKindSelect.innerHTML = FLOW_KINDS.map((kind) => option(kind, els.edgeFlowKindSelect.value || "information", ontologyLabel("flow_types", kind))).join("");
+// DS-7: edge change-moves. reroutable / eliminable + change cost/time.
+// Stored as edge.change = { reroutable, eliminable, cost:{value,unit}, time:{value,unit} }.
+function renderEdgeChangeEditor(edge) {
+  const change = edge.change || {};
+  const cost = change.cost || {};
+  const time = change.time || {};
+  return `
+    <div class="field change-moves">
+      <div class="section-title"><span>Change moves</span></div>
+      <div class="type-help">How this edge can change in the design space, with the cost and time each move incurs.</div>
+      <div class="change-toggles">
+        <label class="checkbox-field"><input type="checkbox" data-edge-change-field="reroutable" ${change.reroutable ? "checked" : ""} /><span>Reroutable</span></label>
+        <label class="checkbox-field"><input type="checkbox" data-edge-change-field="eliminable" ${change.eliminable ? "checked" : ""} /><span>Eliminable</span></label>
+      </div>
+      <div class="quantity-grid">
+        <span class="quantity-label">Cost</span>
+        <input type="text" data-edge-change-field="cost_value" value="${escapeAttribute(cost.value ?? "")}" placeholder="amount" aria-label="Change cost amount" />
+        <input type="text" data-edge-change-field="cost_unit" value="${escapeAttribute(cost.unit ?? "")}" placeholder="unit (e.g. USD)" aria-label="Change cost unit" />
+        <span class="quantity-label">Time</span>
+        <input type="text" data-edge-change-field="time_value" value="${escapeAttribute(time.value ?? "")}" placeholder="amount" aria-label="Change time amount" />
+        <input type="text" data-edge-change-field="time_unit" value="${escapeAttribute(time.unit ?? "")}" placeholder="unit (e.g. wk)" aria-label="Change time unit" />
+      </div>
+    </div>`;
 }
 
-function renderEdgeTypeHelp() {
-  const type = els.edgeTypeSelect.value || "flow";
-  const definition = graph.ontology?.edge_types?.[type] || DEFAULT_ONTOLOGY.edge_types[type];
-  els.edgeTypeHelp.textContent = definition?.description || "";
-}
-
-function renderEdgeFlowKindHelp() {
-  const kind = els.edgeFlowKindSelect.value || "information";
-  const definition = graph.ontology?.flow_types?.[kind] || DEFAULT_ONTOLOGY.flow_types[kind];
-  els.edgeFlowKindHelp.textContent = definition ? `Flow kind: ${definition.description}` : "";
+// DS-5: node variants. "Variant of" base node + adoption cost/time. Setting a
+// base stores { variant_of, adoption: { cost, time } } on the node. Also offers
+// "Create variant of this node" which clones into a new node tagged variant_of.
+function renderNodeVariantEditor(node) {
+  const adoption = node.adoption || {};
+  const cost = adoption.cost || {};
+  const time = adoption.time || {};
+  const isVariant = typeof node.variant_of === "string" && node.variant_of.trim();
+  const baseOptions = graph.nodes
+    .filter((other) => other.id !== node.id && other.type !== "resource")
+    .map((other) => `<option value="${escapeAttribute(other.id)}"${node.variant_of === other.id ? " selected" : ""}>${escapeHtml(other.name || other.id)}</option>`)
+    .join("");
+  return `
+    <div class="field node-variant">
+      <div class="section-title"><span>Variant</span></div>
+      <div class="type-help">Tag this node as a variant of a base node (an alternative the search may adopt), and record what adopting it costs.</div>
+      <label class="field">
+        <span>Variant of</span>
+        <select data-node-variant-field="variant_of">
+          <option value=""${isVariant ? "" : " selected"}>— none —</option>
+          ${baseOptions}
+        </select>
+      </label>
+      ${
+        isVariant
+          ? `<div class="quantity-grid">
+              <span class="quantity-label">Adoption cost</span>
+              <input type="text" data-node-variant-field="cost_value" value="${escapeAttribute(cost.value ?? "")}" placeholder="amount" aria-label="Adoption cost amount" />
+              <input type="text" data-node-variant-field="cost_unit" value="${escapeAttribute(cost.unit ?? "")}" placeholder="unit (e.g. USD)" aria-label="Adoption cost unit" />
+              <span class="quantity-label">Adoption time</span>
+              <input type="text" data-node-variant-field="time_value" value="${escapeAttribute(time.value ?? "")}" placeholder="amount" aria-label="Adoption time amount" />
+              <input type="text" data-node-variant-field="time_unit" value="${escapeAttribute(time.unit ?? "")}" placeholder="unit (e.g. wk)" aria-label="Adoption time unit" />
+            </div>`
+          : ""
+      }
+      <button class="button secondary full" type="button" data-create-variant="${escapeAttribute(node.id)}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1" /></svg>
+        Create variant of this node
+      </button>
+    </div>`;
 }
 
 function renderValidation() {
@@ -2031,8 +3054,25 @@ function renderValidation() {
   const warnings = items.filter((item) => item.level === "warn").length;
   const complete = errors === 0 && warnings === 0;
   els.readinessBadge.textContent = complete ? "handoff readiness high" : `${errors} errors, ${warnings} warnings`;
-  els.readinessBadge.style.color = errors ? "var(--danger)" : warnings ? "var(--orange)" : "var(--green)";
+  const healthColor = errors ? "var(--danger)" : warnings ? "var(--orange)" : "var(--green)";
+  els.readinessBadge.style.color = healthColor;
+  if (els.validationStatusDot) {
+    els.validationStatusDot.style.background = healthColor;
+    els.validationStatusDot.title = els.readinessBadge.textContent;
+  }
   els.allowCyclesInput.checked = allowCycles;
+  if (els.validateViewInput) els.validateViewInput.checked = validateCurrentView;
+
+  const scope = report.scope;
+  if (els.validationScopeNote) {
+    if (scope && scope.scoped) {
+      els.validationScopeNote.hidden = false;
+      els.validationScopeNote.textContent = `Validating current view: ${scope.visibleNodeCount} of ${scope.totalNodeCount} nodes`;
+    } else {
+      els.validationScopeNote.hidden = true;
+      els.validationScopeNote.textContent = "";
+    }
+  }
 
   els.validationList.innerHTML = items.length
     ? items
@@ -2053,97 +3093,43 @@ function renderValidation() {
     `;
 }
 
-function renderResources() {
-  els.resourceCount.textContent = `${graph.resources.length}`;
-  if (!resourcesOpen) {
-    els.resourceList.innerHTML = "";
-    return;
-  }
+// Constraints live inside the element editor modal (Constraints tab). Each
+// constraint is OWNED by the selected node/edge via fields.target = element id.
+function renderElementConstraints() {
+  if (!els.elementConstraints) return;
+  const ownerId = selected.id;
+  const owned =
+    (selected.kind === "node" || selected.kind === "edge") && ownerId
+      ? graph.constraints.filter((constraint) => constraint.fields?.target === ownerId)
+      : [];
 
-  els.resourceList.innerHTML =
-    graph.resources
-      .map(
-        (resource) => `
-          <div class="resource-item" data-resource-id="${resource.id}">
-            <div class="field-grid">
-              <label class="field">
-                <span>Name</span>
-                <input type="text" data-resource-field="name" value="${escapeAttribute(resource.name)}" />
-              </label>
-              <label class="field">
-                <span>Type</span>
-                <select data-resource-field="type">${RESOURCE_TYPES.map((type) => option(type, resource.type, ontologyLabel("resource_types", type))).join("")}</select>
-              </label>
-            </div>
-            <span>${escapeHtml(resource.id)}</span>
+  const helpTip = `<div class="type-help">Write each constraint in plain language as a relationship between inputs, properties, outputs, resources, or capacity. Example: "Blending tank capacity is 5,000 L; the combined volume of input flows must not exceed it."</div>`;
+
+  const rows = owned
+    .map(
+      (constraint) => `
+        <div class="constraint-item" data-constraint-id="${escapeAttribute(constraint.id)}">
+          <label class="field">
+            <span>Constraint</span>
+            <textarea data-constraint-field="expression" placeholder="Describe the constraint in plain language…">${escapeHtml(constraint.expression || "")}</textarea>
+          </label>
+          <div class="constraint-meta">
+            <button class="icon-button danger" type="button" title="Remove constraint" data-delete-constraint="${escapeAttribute(constraint.id)}">✕</button>
           </div>
-        `
-      )
-      .join("") ||
-    `<div class="resource-item"><div><strong>No resources</strong><span>Add human, machine, or material resources.</span></div></div>`;
-}
+        </div>
+      `
+    )
+    .join("");
 
-function renderConstraints() {
-  const associated = selected.kind ? graph.constraints.filter((constraint) => constraintMatchesSelection(constraint)) : [];
-  const list = associated.length ? associated : graph.constraints;
-  const isOpen = constraintsOpen || associated.length > 0;
-  els.constraintCount.textContent = associated.length ? `${associated.length} matching` : `${graph.constraints.length}`;
-  if (!isOpen) {
-    els.constraintList.innerHTML = "";
-    return;
-  }
+  const addButton = `<button class="button secondary full" type="button" data-add-constraint>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+      Add constraint
+    </button>`;
 
-  const markup = list
-      .map(
-        (constraint) => `
-          <div class="constraint-item" data-constraint-id="${constraint.id}">
-            <div>
-              <div class="field-grid">
-                <label class="field">
-                  <span>Type</span>
-                  <select data-constraint-field="type">${CONSTRAINT_TYPES.map((type) => option(type, constraint.type, ontologyLabel("constraint_types", type))).join("")}</select>
-                </label>
-                <label class="field">
-                  <span>Target</span>
-                  <input list="constraintTargetOptions" type="text" data-constraint-field="target" value="${escapeAttribute(constraint.fields?.target || "")}" placeholder="Node, edge, resource..." />
-                </label>
-              </div>
-              <div class="field-grid three">
-                <label class="field">
-                  <span>What</span>
-                  <input type="text" data-constraint-field="metric" value="${escapeAttribute(constraint.fields?.metric || "")}" placeholder="cash, part, resource, duration..." />
-                </label>
-                <label class="field">
-                  <span>Rule</span>
-                  <select data-constraint-field="operator">${CONSTRAINT_OPERATORS.map((operator) => option(operator, constraint.fields?.operator || "equals", operatorLabel(operator))).join("")}</select>
-                </label>
-                <label class="field">
-                  <span>Value</span>
-                  <input type="text" data-constraint-field="value" value="${escapeAttribute(constraint.fields?.value || "")}" placeholder="TBD" />
-                </label>
-              </div>
-              <label class="field">
-                <span>Unit</span>
-                <input type="text" data-constraint-field="unit" value="${escapeAttribute(constraint.fields?.unit || "")}" placeholder="Optional" />
-              </label>
-              <label class="field">
-                <span>Notes</span>
-                <input type="text" data-constraint-field="notes" value="${escapeAttribute(constraint.fields?.notes || "")}" placeholder="Why this constraint exists" />
-              </label>
-              <div class="type-help">${escapeHtml(ontologyDescription("constraint_types", constraint.type))}</div>
-              <div class="type-help"><strong>Spec:</strong> ${escapeHtml(constraint.expression || constraintExpression(constraint))}</div>
-            </div>
-            <span>${escapeHtml(constraint.id)}</span>
-          </div>
-        `
-      )
-      .join("");
-
-  els.constraintList.innerHTML = markup
-    ? `${markup}<datalist id="constraintTargetOptions">${constraintTargetOptions()
-        .map((target) => `<option value="${escapeAttribute(target)}"></option>`)
-        .join("")}</datalist>`
-    : `<div class="constraint-item"><div><strong>No constraints</strong><span>Add flow balance, capability limit, timing, routing, or policy constraints.</span></div></div>`;
+  els.elementConstraints.innerHTML =
+    helpTip +
+    (rows || `<div class="type-help">No constraints on this element yet.</div>`) +
+    addButton;
 }
 
 function renderOntology() {
@@ -2213,8 +3199,6 @@ function handleOntologyInput(event) {
     ...(graph.ontology[group][id] || {}),
     [field]: event.target.value,
   };
-  renderEdgeBuilder();
-  renderEdgeTypeHelp();
   saveState();
 }
 
@@ -2314,6 +3298,7 @@ function handleCanvasPointerDown(event) {
       nodeId,
       offsetX: pointer.x - pos.x,
       offsetY: pointer.y - pos.y,
+      moved: false,
     };
     els.graphCanvas.setPointerCapture(event.pointerId);
     render();
@@ -2324,6 +3309,7 @@ function handleCanvasPointerDown(event) {
     const edgeId = edgeTarget.dataset.edgeId;
     selected = { kind: "edge", id: edgeId };
     render();
+    openElementEditor();
     return;
   }
 
@@ -2388,6 +3374,7 @@ function handleCanvasPointerMove(event) {
 
   if (!dragState) return;
   const pointer = canvasPoint(event);
+  dragState.moved = true;
   layout[dragState.nodeId] = {
     x: Math.max(20, pointer.x - dragState.offsetX),
     y: Math.max(20, pointer.y - dragState.offsetY),
@@ -2447,8 +3434,10 @@ function handleCanvasPointerUp(event) {
   if (els.graphCanvas.hasPointerCapture(event.pointerId)) {
     els.graphCanvas.releasePointerCapture(event.pointerId);
   }
+  const wasClick = !dragState.moved;
   dragState = null;
   render();
+  if (wasClick) openElementEditor();
 }
 
 function handleInspectorInput(event) {
@@ -2456,7 +3445,6 @@ function handleInspectorInput(event) {
   const edgeField = event.target.dataset.edgeField;
   const edgeFlowField = event.target.dataset.edgeFlowField;
   const nodeListField = event.target.dataset.nodeListField;
-  const resourceReqField = event.target.dataset.resourceReqField;
 
   if (nodeField && selected.kind === "node") {
     const node = graph.nodes.find((item) => item.id === selected.id);
@@ -2497,7 +3485,6 @@ function handleInspectorInput(event) {
         statusEl.textContent = definitionStatusLabel(status);
       }
       if (approveButton) approveButton.disabled = status === "approved";
-      saveState();
     }
     if (nodeField === "name" && payload.description) {
       const definitionInput = els.inspectorContent.querySelector("[data-node-field='description']");
@@ -2510,7 +3497,6 @@ function handleInspectorInput(event) {
       }
       if (approveButton) approveButton.disabled = false;
     }
-    if (nodeField !== "type") saveState();
     if (nodeField === "type") renderInspector();
   }
 
@@ -2533,15 +3519,18 @@ function handleInspectorInput(event) {
     renderCanvas();
     renderValidation();
     updateStatus();
-    if (edgeField === "type") renderInspector();
   }
 
   if (edgeField && selected.kind === "edge") {
+    const payload = { [edgeField]: event.target.value };
+    if (edgeField === "description") {
+      payload.description_status = event.target.value.trim() ? "custom" : "empty";
+    }
     applyMutation(
       {
         action: "update_edge",
         target_id: selected.id,
-        payload: { [edgeField]: event.target.value },
+        payload,
         reason: `Inspector updated edge ${edgeField}`,
         confidence: "high",
       },
@@ -2550,6 +3539,14 @@ function handleInspectorInput(event) {
     renderCanvas();
     renderValidation();
     updateStatus();
+    if (edgeField === "description") {
+      const status = payload.description_status;
+      const statusEl = els.inspectorContent.querySelector(".definition-status");
+      if (statusEl) {
+        statusEl.className = `definition-status ${status}`;
+        statusEl.textContent = definitionStatusLabel(status);
+      }
+    }
   }
 
   if (edgeFlowField && selected.kind === "edge") {
@@ -2558,7 +3555,13 @@ function handleInspectorInput(event) {
     const flows = normalizeFlows(edge.flows);
     const index = Number(event.target.dataset.edgeFlowIndex);
     const current = flows[index] || createFlow({});
-    current[edgeFlowField] = event.target.value;
+    // DS-6: flow economics composite fields (value/cost = { value, unit }).
+    if (["value_value", "value_unit", "cost_value", "cost_unit"].includes(edgeFlowField)) {
+      const [econ, part] = edgeFlowField.split("_");
+      current[econ] = { ...(current[econ] || {}), [part]: event.target.value };
+    } else {
+      current[edgeFlowField] = event.target.value;
+    }
     if (edgeFlowField === "name" && (!current.kind || current.kind === "custom")) {
       current.kind = inferFlowKind(event.target.value);
     }
@@ -2579,27 +3582,110 @@ function handleInspectorInput(event) {
     renderOntology();
   }
 
-  if (resourceReqField && selected.kind === "node") {
-    const node = graph.nodes.find((item) => item.id === selected.id);
-    if (!node) return;
-    const requirements = normalizeResourceRequirements(node.resources_required);
-    const index = Number(event.target.dataset.resourceReqIndex);
-    const current = requirements[index] || { name: "", quantity: "" };
-    current[resourceReqField] = event.target.value;
-    if (resourceReqField === "name") current.resource_id = findResourceIdByName(event.target.value) || "";
-    requirements[index] = current;
+  // DS-7: edge change-moves. Rebuild edge.change from the section's inputs.
+  const edgeChangeField = event.target.dataset.edgeChangeField;
+  if (edgeChangeField && selected.kind === "edge") {
+    const edge = graph.edges.find((item) => item.id === selected.id);
+    if (!edge) return;
+    const change = buildChangeFromInputs();
+    const payload = { change: change || null };
     applyMutation(
       {
-        action: "update_node",
+        action: "update_edge",
         target_id: selected.id,
-        payload: { resources_required: requirements },
-        reason: "Inspector updated node resource requirement",
+        payload,
+        reason: "Inspector updated edge change moves",
         confidence: "high",
       },
       { rerender: false, log: false }
     );
-    inferOntologyFromGraph();
-    renderValidation();
+    updateStatus();
+  }
+
+  // DS-5: node variant base + adoption cost/time. Both the variant_of select
+  // and the adoption inputs route here (input + change both fire this handler).
+  const nodeVariantField = event.target.dataset.nodeVariantField;
+  if (nodeVariantField && selected.kind === "node") {
+    const node = graph.nodes.find((item) => item.id === selected.id);
+    if (!node) return;
+    if (nodeVariantField === "variant_of") {
+      applyNodeVariantOf(node, event.target.value);
+      renderInspector();
+      renderCanvas();
+      updateStatus();
+    } else {
+      const adoption = buildAdoptionFromInputs();
+      applyMutation(
+        {
+          action: "update_node",
+          target_id: selected.id,
+          payload: { adoption },
+          reason: "Inspector updated node adoption",
+          confidence: "high",
+        },
+        { rerender: false, log: false }
+      );
+      updateStatus();
+    }
+  }
+
+  // Properties (key/value or quantitative parameter) for nodes (attributes) and
+  // edges (properties). Rebuild the whole store from all rows so renaming a key
+  // drops the old key; promoted rows assemble a parameter object (DS-1).
+  // Fires for plain value/key inputs AND parameter sub-field inputs.
+  const propTarget = event.target.dataset.propTarget;
+  if (propTarget && (event.target.dataset.propPart || event.target.dataset.propField) && selected.kind === propTarget) {
+    const collection = propTarget === "edge" ? graph.edges : graph.nodes;
+    const obj = collection.find((item) => item.id === selected.id);
+    if (!obj) return;
+    const store = collectPropertyStore(propTarget);
+    const payload = propTarget === "edge" ? { properties: store } : { attributes: store };
+    applyMutation(
+      {
+        action: propTarget === "edge" ? "update_edge" : "update_node",
+        target_id: selected.id,
+        payload,
+        reason: `Inspector updated ${propTarget} properties`,
+        confidence: "high",
+      },
+      { rerender: false, log: false }
+    );
+    // The uncertainty-kind and variable-domain selects change which sub-inputs
+    // are shown; re-render so the editor reflects the new shape.
+    if (["unc_kind", "var_kind", "variable_on", "unc_percent"].includes(event.target.dataset.propField)) {
+      renderInspector();
+    }
+    renderCanvas();
+    updateStatus();
+  }
+
+  // Perspectives ({ label, text }) for nodes and edges. Rebuild list from all rows.
+  const perspectiveTarget = event.target.dataset.perspectiveTarget;
+  if (perspectiveTarget && selected.kind === perspectiveTarget) {
+    const collection = perspectiveTarget === "edge" ? graph.edges : graph.nodes;
+    const obj = collection.find((item) => item.id === selected.id);
+    if (!obj) return;
+    const inputs = [...els.inspectorContent.querySelectorAll(`[data-perspective-target="${perspectiveTarget}"][data-perspective-part]`)];
+    const byIndex = {};
+    inputs.forEach((input) => {
+      const index = input.dataset.perspectiveIndex;
+      byIndex[index] = byIndex[index] || { label: "", text: "" };
+      byIndex[index][input.dataset.perspectivePart] = input.value;
+    });
+    const perspectives = Object.keys(byIndex)
+      .sort((a, b) => Number(a) - Number(b))
+      .map((index) => byIndex[index]);
+    applyMutation(
+      {
+        action: perspectiveTarget === "edge" ? "update_edge" : "update_node",
+        target_id: selected.id,
+        payload: { perspectives },
+        reason: `Inspector updated ${perspectiveTarget} perspectives`,
+        confidence: "high",
+      },
+      { rerender: false, log: false }
+    );
+    updateStatus();
   }
 }
 
@@ -2608,26 +3694,29 @@ function handleInspectorClick(event) {
   const deleteEdgeId = event.target.closest("[data-delete-edge]")?.dataset.deleteEdge;
   const addIoField = event.target.closest("[data-add-io]")?.dataset.addIo;
   const removeIoButton = event.target.closest("[data-remove-io]");
-  const addResourceReq = event.target.closest("[data-add-resource-req]");
-  const removeResourceReq = event.target.closest("[data-remove-resource-req]")?.dataset.removeResourceReq;
+  const addPropButton = event.target.closest("[data-add-prop]");
+  const removePropButton = event.target.closest("[data-remove-prop]");
+  const paramToggleButton = event.target.closest("[data-prop-toggle='parameter']");
+  const createVariantButton = event.target.closest("[data-create-variant]");
+  const addPerspectiveButton = event.target.closest("[data-add-perspective]");
+  const removePerspectiveButton = event.target.closest("[data-remove-perspective]");
   const addEdgeFlow = event.target.closest("[data-add-edge-flow]");
   const removeEdgeFlow = event.target.closest("[data-remove-edge-flow]")?.dataset.removeEdgeFlow;
   const toggleAddNodeForm = event.target.closest("[data-toggle-add-node-form]");
-  const toggleAddEdgeForm = event.target.closest("[data-toggle-add-edge-form]");
   const createNodeButton = event.target.closest("[data-create-node]");
   const suggestNodeDescriptionButton = event.target.closest("[data-suggest-node-description]");
   const approveNodeDescriptionButton = event.target.closest("[data-approve-node-description]");
+  const showFullGraphButton = event.target.closest("[data-show-full-graph]");
+
+  if (showFullGraphButton) {
+    clearViewFilter();
+    renderInspector();
+    return;
+  }
 
   if (toggleAddNodeForm) {
     addNodeFormOpen = !addNodeFormOpen;
     renderInspector();
-    saveState();
-    return;
-  }
-
-  if (toggleAddEdgeForm) {
-    addEdgeFormOpen = !addEdgeFormOpen;
-    renderEdgeBuilder();
     saveState();
     return;
   }
@@ -2699,6 +3788,7 @@ function handleInspectorClick(event) {
       confidence: "high",
     });
     selected = { kind: null, id: null };
+    closeElementEditor();
     render();
   }
 
@@ -2711,6 +3801,7 @@ function handleInspectorClick(event) {
       confidence: "high",
     });
     selected = { kind: null, id: null };
+    closeElementEditor();
     render();
   }
 
@@ -2742,35 +3833,158 @@ function handleInspectorClick(event) {
     });
   }
 
-  if (addResourceReq && selected.kind === "node") {
-    const node = graph.nodes.find((item) => item.id === selected.id);
-    if (!node) return;
-    const firstResource = graph.resources[0];
-    const requirements = normalizeResourceRequirements(node.resources_required);
-    requirements.push({
-      resource_id: firstResource?.id || "",
-      name: firstResource?.name || "",
-      quantity: "1",
-    });
+  if (addPropButton) {
+    const propTarget = addPropButton.dataset.addProp || "node";
+    if (selected.kind !== propTarget) return;
+    const collection = propTarget === "edge" ? graph.edges : graph.nodes;
+    const obj = collection.find((item) => item.id === selected.id);
+    if (!obj) return;
+    const store = propTarget === "edge" ? { ...(obj.properties || {}) } : { ...(obj.attributes || {}) };
+    // Find a free placeholder key so the new (empty-value) row persists and renders.
+    let key = "new_property";
+    let counter = 1;
+    while (Object.prototype.hasOwnProperty.call(store, key)) {
+      counter += 1;
+      key = `new_property_${counter}`;
+    }
+    store[key] = "";
+    const payload = propTarget === "edge" ? { properties: store } : { attributes: store };
     applyMutation({
-      action: "update_node",
+      action: propTarget === "edge" ? "update_edge" : "update_node",
       target_id: selected.id,
-      payload: { resources_required: requirements },
-      reason: "Inspector added resource requirement",
+      payload,
+      reason: `Inspector added ${propTarget} property`,
       confidence: "high",
     });
   }
 
-  if (removeResourceReq !== undefined && selected.kind === "node") {
-    const node = graph.nodes.find((item) => item.id === selected.id);
-    if (!node) return;
-    const requirements = normalizeResourceRequirements(node.resources_required);
-    requirements.splice(Number(removeResourceReq), 1);
+  if (removePropButton) {
+    const propTarget = removePropButton.dataset.propTarget || "node";
+    if (selected.kind !== propTarget) return;
+    const collection = propTarget === "edge" ? graph.edges : graph.nodes;
+    const obj = collection.find((item) => item.id === selected.id);
+    if (!obj) return;
+    const index = Number(removePropButton.dataset.removeProp);
+    const entries = Object.entries(propTarget === "edge" ? obj.properties || {} : obj.attributes || {});
+    entries.splice(index, 1);
+    const store = Object.fromEntries(entries);
+    const payload = propTarget === "edge" ? { properties: store } : { attributes: store };
     applyMutation({
-      action: "update_node",
+      action: propTarget === "edge" ? "update_edge" : "update_node",
       target_id: selected.id,
-      payload: { resources_required: requirements },
-      reason: "Inspector removed resource requirement",
+      payload,
+      reason: `Inspector removed ${propTarget} property`,
+      confidence: "high",
+    });
+  }
+
+  // DS-5: clone the selected node into a NEW variant node tagged variant_of the
+  // original, with copied attributes, placed near the original, then open it.
+  if (createVariantButton) {
+    const baseId = createVariantButton.dataset.createVariant;
+    const base = graph.nodes.find((item) => item.id === baseId);
+    if (!base) return;
+    const newId = uniqueId(`${base.id}_variant`);
+    const variant = createNode({
+      id: newId,
+      name: `${base.name || base.id} (variant)`,
+      type: base.type,
+      inputs: [...(base.inputs || [])],
+      outputs: [...(base.outputs || [])],
+      attributes: clone(base.attributes || {}),
+      variant_of: base.id,
+      adoption: {},
+    });
+    const basePoint = layout[base.id];
+    applyMutation(
+      {
+        action: "add_node",
+        target_id: null,
+        payload: variant,
+        reason: "Inspector created node variant",
+        confidence: "high",
+      },
+      { rerender: false, log: true }
+    );
+    // Place near the original (offset) rather than the default grid slot.
+    layout[newId] = basePoint ? { x: basePoint.x + 60, y: basePoint.y + 90 } : nextLayoutPoint();
+    selected = { kind: "node", id: newId };
+    render();
+    openElementEditor();
+    toast("Variant created");
+    return;
+  }
+
+  // DS-1: promote a plain value to a quantitative parameter, or demote back to
+  // a plain string. Reads the live DOM store, swaps just this key, re-renders.
+  if (paramToggleButton) {
+    const propTarget = paramToggleButton.dataset.propTarget || "node";
+    if (selected.kind !== propTarget) return;
+    const collection = propTarget === "edge" ? graph.edges : graph.nodes;
+    const obj = collection.find((item) => item.id === selected.id);
+    if (!obj) return;
+    const index = paramToggleButton.dataset.propIndex;
+    const keyInput = els.inspectorContent.querySelector(
+      `[data-prop-target="${propTarget}"][data-prop-index="${index}"][data-prop-part="key"]`
+    );
+    const key = (keyInput?.value || "").trim();
+    const store = collectPropertyStore(propTarget);
+    if (key) {
+      const promote = paramToggleButton.getAttribute("aria-pressed") !== "true";
+      const current = store[key];
+      if (promote) {
+        const numeric = isParameterValue(current) ? current : { value: String(current ?? "") };
+        store[key] = normalizeParameter(numeric);
+      } else {
+        store[key] = isParameterValue(current) ? String(current.value ?? "") : String(current ?? "");
+      }
+    }
+    const payload = propTarget === "edge" ? { properties: store } : { attributes: store };
+    applyMutation(
+      {
+        action: propTarget === "edge" ? "update_edge" : "update_node",
+        target_id: selected.id,
+        payload,
+        reason: `Inspector ${paramToggleButton.getAttribute("aria-pressed") === "true" ? "demoted" : "promoted"} ${propTarget} property`,
+        confidence: "high",
+      },
+      { rerender: false, log: false }
+    );
+    renderInspector();
+    renderCanvas();
+    updateStatus();
+    return;
+  }
+
+  if (addPerspectiveButton) {
+    const perspectiveTarget = addPerspectiveButton.dataset.addPerspective || "node";
+    if (selected.kind !== perspectiveTarget) return;
+    const collection = perspectiveTarget === "edge" ? graph.edges : graph.nodes;
+    const obj = collection.find((item) => item.id === selected.id);
+    if (!obj) return;
+    const perspectives = [...(Array.isArray(obj.perspectives) ? obj.perspectives : []), { label: "New perspective", text: "" }];
+    applyMutation({
+      action: perspectiveTarget === "edge" ? "update_edge" : "update_node",
+      target_id: selected.id,
+      payload: { perspectives },
+      reason: `Inspector added ${perspectiveTarget} perspective`,
+      confidence: "high",
+    });
+  }
+
+  if (removePerspectiveButton) {
+    const perspectiveTarget = removePerspectiveButton.dataset.perspectiveTarget || "node";
+    if (selected.kind !== perspectiveTarget) return;
+    const collection = perspectiveTarget === "edge" ? graph.edges : graph.nodes;
+    const obj = collection.find((item) => item.id === selected.id);
+    if (!obj) return;
+    const perspectives = [...(Array.isArray(obj.perspectives) ? obj.perspectives : [])];
+    perspectives.splice(Number(removePerspectiveButton.dataset.removePerspective), 1);
+    applyMutation({
+      action: perspectiveTarget === "edge" ? "update_edge" : "update_node",
+      target_id: selected.id,
+      payload: { perspectives },
+      reason: `Inspector removed ${perspectiveTarget} perspective`,
       confidence: "high",
     });
   }
@@ -2805,97 +4019,59 @@ function handleInspectorClick(event) {
   }
 }
 
-function handleResourceInput(event) {
-  const item = event.target.closest("[data-resource-id]");
-  if (!item || !event.target.dataset.resourceField) return;
-  applyMutation(
-    {
-      action: "update_resource",
-      target_id: item.dataset.resourceId,
-      payload: { [event.target.dataset.resourceField]: event.target.value },
-      reason: "Resource edited in inspector",
-      confidence: "high",
-    },
-    { rerender: false, log: false }
-  );
-  inferOntologyFromGraph();
-  renderInspector();
-  renderValidation();
-  renderOntology();
-}
-
-function handleConstraintInput(event) {
+function handleElementConstraintInput(event) {
   const item = event.target.closest("[data-constraint-id]");
-  if (!item || !event.target.dataset.constraintField) return;
+  if (!item || event.target.dataset.constraintField !== "expression") return;
   const constraint = graph.constraints.find((entry) => entry.id === item.dataset.constraintId);
   if (!constraint) return;
-  const field = event.target.dataset.constraintField;
-  const payload = {};
-  if (field === "type") {
-    payload.type = event.target.value;
-    payload.fields = {
-      ...createConstraintFields(event.target.value, constraint.fields?.target || ""),
-      value: constraint.fields?.value || "",
-    };
-  } else {
-    const value = field === "target" && event.type === "change" ? normalizeConstraintTarget(event.target.value) : event.target.value;
-    payload.fields = { ...(constraint.fields || {}), [field]: value };
-    if (field === "target" && value !== event.target.value) event.target.value = value;
-  }
-  const nextConstraint = { ...constraint, ...payload, fields: payload.fields || constraint.fields || {} };
-  payload.expression = constraintExpression(nextConstraint);
   applyMutation(
     {
       action: "update_constraint",
       target_id: item.dataset.constraintId,
-      payload,
-      reason: "Constraint edited in inspector",
+      payload: { expression: event.target.value },
+      reason: "Constraint edited on element",
       confidence: "high",
     },
     { rerender: false, log: false }
   );
-  inferOntologyFromGraph();
   renderValidation();
-  renderOntology();
+  // The textarea already displays the committed value, so we skip re-rendering to preserve focus.
 }
 
-function selectedTargetCandidates() {
-  if (selected.kind === "node") {
-    const node = graph.nodes.find((item) => item.id === selected.id);
-    return node ? [node.name, node.id] : [];
+function handleElementConstraintClick(event) {
+  if (event.target.closest("[data-add-constraint]")) {
+    addConstraintForSelected();
+    return;
   }
-  if (selected.kind === "edge") {
-    const edge = graph.edges.find((item) => item.id === selected.id);
-    if (!edge) return [];
-    const from = graph.nodes.find((node) => node.id === edge.from_node)?.name || edge.from_node;
-    const to = graph.nodes.find((node) => node.id === edge.to_node)?.name || edge.to_node;
-    return [edge.id, `${from} to ${to}`, `${from} -> ${to}`];
-  }
-  return [];
+  const deleteButton = event.target.closest("[data-delete-constraint]");
+  if (!deleteButton) return;
+  const id = deleteButton.dataset.deleteConstraint;
+  const index = graph.constraints.findIndex((entry) => entry.id === id);
+  if (index === -1) return;
+  pushUndoSnapshot("Before remove constraint");
+  graph.constraints.splice(index, 1);
+  inferOntologyFromGraph();
+  renderElementConstraints();
+  renderValidation();
+  saveState();
 }
 
-function constraintMatchesSelection(constraint) {
-  const target = slug(constraint.fields?.target || "");
-  if (!target) return false;
-  return selectedTargetCandidates().some((candidate) => slug(candidate) === target);
-}
-
-function constraintTargetOptions() {
-  return [
-    ...graph.nodes.flatMap((node) => [node.name, node.id]),
-    ...graph.edges.map((edge) => edge.id),
-    ...graph.resources.flatMap((resource) => [resource.name, resource.id]),
-    "Graph",
-  ].filter(Boolean);
-}
-
-function normalizeConstraintTarget(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return "";
-  const target = constraintTargetOptions().find((candidate) => slug(candidate) === slug(raw));
-  if (target) return target;
-  const partial = constraintTargetOptions().find((candidate) => slug(candidate).startsWith(slug(raw)));
-  return partial || raw;
+function addConstraintForSelected() {
+  if (selected.kind !== "node" && selected.kind !== "edge") return;
+  if (!selected.id) return;
+  const id = uniqueId(`c_${slug(selected.id)}_${graph.constraints.length + 1}`);
+  applyMutation(
+    {
+      action: "add_constraint",
+      target_id: null,
+      payload: createConstraint({ id, type: "policy_rule", expression: "", fields: { target: selected.id } }),
+      reason: "Added constraint on element",
+      confidence: "medium",
+    },
+    { rerender: false, log: true }
+  );
+  renderElementConstraints();
+  renderValidation();
 }
 
 function addNodeFromToolbar(type) {
@@ -2915,63 +4091,6 @@ function addNodeFromToolbar(type) {
   render();
 }
 
-function addEdgeFromInspector() {
-  const from = els.edgeFromSelect.value;
-  const to = els.edgeToSelect.value;
-  if (!from || !to || from === to) {
-    toast("Choose two different nodes");
-    return;
-  }
-  const type = els.edgeTypeSelect.value;
-  const condition = els.edgeConditionInput.value.trim();
-  const flowName = els.edgeFlowNameInput.value.trim();
-  const flowKind = els.edgeFlowKindSelect.value || "information";
-  const id = uniqueId(`e_${slug(from)}_${slug(to)}`);
-  const explicitFlows = flowName ? [createFlow({ name: flowName, kind: flowKind })] : [];
-  const inferredFlows = explicitFlows.length ? explicitFlows : inferEdgeFlowsFromNodes({ from_node: from, to_node: to });
-  applyMutation({
-    action: "add_edge",
-    target_id: null,
-    payload: { id, from_node: from, to_node: to, type, condition, flows: inferredFlows },
-    reason: "Inspector added edge",
-    confidence: "high",
-  });
-  selected = { kind: "edge", id };
-  els.edgeConditionInput.value = "";
-  els.edgeFlowNameInput.value = "";
-  render();
-}
-
-function addResource() {
-  const id = uniqueId(`r_resource_${graph.resources.length + 1}`);
-  resourcesOpen = true;
-  applyMutation({
-    action: "add_resource",
-    target_id: null,
-    payload: { id, name: `Resource ${graph.resources.length + 1}`, type: "human", attributes: {} },
-    reason: "Inspector added resource",
-    confidence: "high",
-  });
-  render();
-}
-
-function addConstraint() {
-  const id = uniqueId(`c_constraint_${graph.constraints.length + 1}`);
-  constraintsOpen = true;
-  const constraint = createConstraint({
-    id,
-    type: "flow_balance",
-    fields: createConstraintFields("flow_balance", selected.kind === "node" ? graph.nodes.find((node) => node.id === selected.id)?.name || "" : ""),
-  });
-  applyMutation({
-    action: "add_constraint",
-    target_id: null,
-    payload: constraint,
-    reason: "Inspector added constraint",
-    confidence: "medium",
-  });
-  render();
-}
 
 function applyMutations(mutations) {
   if (mutations.some((mutation) => GRAPH_MUTATION_ACTIONS.includes(mutation.action))) {
@@ -3034,7 +4153,9 @@ function applyMutation(mutation, options = {}) {
       const node = graph.nodes.find((item) => item.id === mutation.target_id);
       if (!node) return;
       Object.assign(node, payload);
-      node.attributes = { ...(node.attributes || {}), ...(payload.attributes || {}) };
+      // The Properties editor sends the complete rebuilt attributes object (so a
+      // removed/renamed key drops); use it as a full replacement rather than a merge.
+      node.attributes = payload.attributes ? { ...payload.attributes } : node.attributes || {};
       node.resources_required = normalizeResourceRequirements(node.resources_required);
       break;
     }
@@ -3059,6 +4180,11 @@ function applyMutation(mutation, options = {}) {
       Object.assign(edge, payload);
       edge.type = normalizeEdgeType(edge.type);
       edge.flows = normalizeFlows(edge.flows);
+      edge.resources_required = normalizeResourceRequirements(edge.resources_required);
+      // Properties editor sends the complete rebuilt object — full replacement so
+      // removed/renamed keys drop (mirrors node attributes).
+      edge.properties = payload.properties ? { ...payload.properties } : edge.properties || {};
+      edge.perspectives = normalizePerspectives(edge.perspectives);
       break;
     }
     case "delete_edge": {
@@ -3088,8 +4214,10 @@ function applyMutation(mutation, options = {}) {
       const constraint = graph.constraints.find((item) => item.id === mutation.target_id);
       if (!constraint) return;
       Object.assign(constraint, payload);
-      constraint.fields = { ...(constraint.fields || {}), ...(payload.fields || {}) };
-      constraint.expression = payload.expression || constraintExpression(constraint);
+      // expression is the source of truth (free text); fields kept only for back-compat.
+      if (payload.fields) {
+        constraint.fields = { ...(constraint.fields || {}), ...payload.fields };
+      }
       break;
     }
     case "add_assumption": {
@@ -3114,7 +4242,14 @@ function applyMutation(mutation, options = {}) {
       timestamp: new Date().toISOString(),
     });
   }
-  if (settings.rerender) render();
+  // Single persistence chokepoint. A full render() already persists via
+  // saveState(); partial-render edits (e.g. inspector field edits) persist here
+  // so no edit is silently lost on reload.
+  if (settings.rerender) {
+    render();
+  } else {
+    saveState();
+  }
 }
 
 function compileInstruction(input) {
@@ -3257,13 +4392,46 @@ function buildCompilerResponse(summary, mutations, questions, warnings) {
   };
 }
 
+// Computes the validation scope. When the "validate current view only" toggle is
+// on AND a filter is active, validation runs against just the view's visible id
+// sets (so a view that hides an orphan's only edge does not report the orphan as
+// newly broken). Otherwise it validates the full graph exactly as before.
+function validationScope() {
+  if (validateCurrentView && filterIsActive(activeFilter)) {
+    const view = resolveView(graph, activeFilter, selected);
+    if (view.active) {
+      const scopedNodes = graph.nodes.filter((node) => view.nodeIds.has(node.id));
+      const scopedEdges = graph.edges.filter((edge) => view.edgeIds.has(edge.id));
+      return {
+        scoped: true,
+        nodes: scopedNodes,
+        edges: scopedEdges,
+        // Constraints are not id-restricted by views, so validate them as-is.
+        constraints: graph.constraints,
+        visibleNodeCount: scopedNodes.length,
+        totalNodeCount: graph.nodes.length,
+      };
+    }
+  }
+  return {
+    scoped: false,
+    nodes: graph.nodes,
+    edges: graph.edges,
+    constraints: graph.constraints,
+    visibleNodeCount: graph.nodes.length,
+    totalNodeCount: graph.nodes.length,
+  };
+}
+
 function validateGraph() {
   const items = [];
-  const nodeIds = new Set(graph.nodes.map((node) => node.id));
-  const incoming = countBy(graph.edges, "to_node");
-  const outgoing = countBy(graph.edges, "from_node");
+  const scope = validationScope();
+  const scopeGraph = { nodes: scope.nodes, edges: scope.edges, constraints: scope.constraints };
+  const nodeIds = new Set(scopeGraph.nodes.map((node) => node.id));
+  const incoming = countBy(scopeGraph.edges, "to_node");
+  const outgoing = countBy(scopeGraph.edges, "from_node");
 
-  graph.edges.forEach((edge) => {
+  scopeGraph.edges.forEach((edge) => {
     if (!nodeIds.has(edge.from_node)) {
       items.push({ level: "error", title: "Invalid edge source", detail: `${edge.id} references ${edge.from_node}` });
     }
@@ -3275,7 +4443,7 @@ function validateGraph() {
     }
   });
 
-  graph.nodes.forEach((node) => {
+  scopeGraph.nodes.forEach((node) => {
     const inCount = incoming[node.id] || 0;
     const outCount = outgoing[node.id] || 0;
     if (node.type === "source" && outCount === 0) {
@@ -3295,7 +4463,7 @@ function validateGraph() {
       });
     }
     if (node.type === "decision" && outCount >= 2) {
-      graph.edges
+      scopeGraph.edges
         .filter((edge) => edge.from_node === node.id)
         .forEach((edge) => {
           if (!edge.condition) {
@@ -3305,22 +4473,15 @@ function validateGraph() {
     }
   });
 
-  graph.constraints.forEach((constraint) => {
-    const fields = constraint.fields || {};
-    if (!fields.target) {
-      items.push({ level: "warn", title: "Constraint target missing", detail: `${constraint.id} should name the node, edge, resource, or boundary it constrains.` });
-    }
-    if ((constraint.type === "capability_limit" || constraint.type === "timing" || constraint.type === "routing_rule" || constraint.type === "policy_rule") && !fields.value) {
-      items.push({ level: "warn", title: "Constraint value missing", detail: `${constraint.id} needs a plain-language value or rule.` });
-    }
-    if (constraint.type === "flow_balance" && !fields.metric) {
-      items.push({ level: "warn", title: "Flow balance item missing", detail: `${constraint.id} should identify what must balance, transform, accumulate, or be lost.` });
+  scopeGraph.constraints.forEach((constraint) => {
+    if (!String(constraint.expression || "").trim()) {
+      items.push({ level: "warn", title: "Constraint statement missing", detail: `${constraint.id} needs a plain-language statement describing the constraint.` });
     }
   });
 
-  items.push(...profileValidationItems());
+  items.push(...profileValidationItems(scopeGraph));
 
-  if (!allowCycles && hasCycle(graph)) {
+  if (!allowCycles && hasCycle(scopeGraph)) {
     items.push({
       level: "warn",
       title: "Cycle detected",
@@ -3328,52 +4489,82 @@ function validateGraph() {
     });
   }
 
-  return { items };
+  return { items, scope };
 }
 
-function profileValidationItems() {
+// Profile-aware hints (P2-1). These are PLAIN-LANGUAGE, read-only suggestions
+// keyed to the selected modeling_style. They are never "error" — style must
+// never block handoff or mutate the graph — only "warn" or "info". Works against
+// the passed-in graph so it composes with the view-scoped validation set.
+function profileValidationItems(targetGraph = graph) {
   const items = [];
   const style = graph.modeling_style || "none";
-  const flowKinds = new Set(graph.edges.flatMap((edge) => normalizeFlows(edge.flows).map((flow) => flow.kind)));
-  const constraintTypes = new Set(graph.constraints.map((constraint) => constraint.type));
-  const hasAllocation = graph.edges.some((edge) => edge.type === "allocation");
+  const nodes = targetGraph.nodes || [];
+  const edges = targetGraph.edges || [];
+  const flowKinds = new Set(edges.flatMap((edge) => normalizeFlows(edge.flows).map((flow) => flow.kind)));
+  const outgoing = countBy(edges, "from_node");
+  const hasType = (type) => nodes.some((node) => node.type === type);
 
   if (style === "business_process") {
-    if (!flowKinds.has("information") && !flowKinds.has("approval")) {
-      items.push({ level: "warn", title: "Business process flow unclear", detail: "Business process style usually needs information or approval flows." });
+    if (!hasType("source")) {
+      items.push({ level: "warn", title: "No start point", detail: "A business process usually has a start (source) node showing where it begins." });
     }
-    if (!constraintTypes.has("policy_rule") && graph.nodes.some((node) => node.type === "decision")) {
-      items.push({ level: "warn", title: "Policy rule missing", detail: "Decision-heavy business processes should capture the policy behind routing." });
+    if (!hasType("sink")) {
+      items.push({ level: "warn", title: "No end point", detail: "A business process usually has an end (sink) node showing where it finishes." });
+    }
+    const thinDecisions = nodes.filter((node) => node.type === "decision" && (outgoing[node.id] || 0) < 2);
+    if (thinDecisions.length) {
+      const names = thinDecisions.map((node) => `"${node.name}"`).join(", ");
+      items.push({
+        level: "info",
+        title: "Decisions should branch",
+        detail: `In a business process, a decision should lead to at least two paths. Add more outgoing edges for: ${names}.`,
+      });
     }
   }
 
   if (style === "value_stream") {
-    if (!flowKinds.has("parts")) {
-      items.push({ level: "warn", title: "Value stream material flow missing", detail: "Value stream style should identify the part, material, or inventory flow." });
-    }
-    if (!constraintTypes.has("timing")) {
-      items.push({ level: "warn", title: "Value stream timing missing", detail: "Add cycle time, wait time, lead time, or transfer time constraints." });
+    if (!flowKinds.has("parts") && !flowKinds.has("information")) {
+      items.push({
+        level: "info",
+        title: "Label your flow kinds",
+        detail: "Value stream maps separate material flows (parts) from information flows. Set each edge's flow kind to 'parts' or 'information' so the two are clear.",
+      });
     }
   }
 
   if (style === "system_flow") {
-    if (!["energy", "data", "parts"].some((kind) => flowKinds.has(kind))) {
-      items.push({ level: "warn", title: "System flow payload missing", detail: "System flow style should include energy, data, material, or interface payloads." });
-    }
-    if (!constraintTypes.has("flow_balance")) {
-      items.push({ level: "warn", title: "System balance missing", detail: "Add flow balance constraints for conserved, transformed, stored, or lost quantities." });
+    const missingPorts = nodes.filter(
+      (node) => !(node.inputs || []).length && !(node.outputs || []).length
+    );
+    if (missingPorts.length) {
+      items.push({
+        level: "info",
+        title: "Add inputs and outputs",
+        detail: `${missingPorts.length} node${missingPorts.length === 1 ? "" : "s"} have no defined inputs or outputs. System flow diagrams read best when each block lists its input and output ports.`,
+      });
     }
   }
 
   if (style === "team_topology") {
-    if (!graph.resources.length) {
-      items.push({ level: "warn", title: "Team topology resources missing", detail: "Add teams, roles, or people as resources for assignment mapping." });
+    if (!hasType("resource")) {
+      items.push({
+        level: "info",
+        title: "Add teams as resources",
+        detail: "Team topology maps usually include teams as resource nodes. Add resource nodes to show who owns each part of the work.",
+      });
     }
-    if (!hasAllocation && !constraintTypes.has("capability_limit")) {
-      items.push({ level: "warn", title: "Assignment mapping missing", detail: "Use allocation edges or capability limits to show ownership and capacity." });
+    const hasInteraction = edges.some((edge) => edge.type === "allocation" || edge.type === "dependency");
+    if (!hasInteraction) {
+      items.push({
+        level: "info",
+        title: "Show team interactions",
+        detail: "Add allocation or dependency edges to show how teams hand work off or depend on each other.",
+      });
     }
   }
 
+  // "none" and "custom" intentionally add no style-specific hints.
   return items;
 }
 
@@ -3438,14 +4629,9 @@ function generateMarkdown() {
     }
     lines.push(`- Inputs: [${node.inputs.join(", ")}]`);
     lines.push(`- Outputs: [${node.outputs.join(", ")}]`);
-    if (node.resources_required.length) {
-      lines.push(
-        `- Resources Required: [${normalizeResourceRequirements(node.resources_required)
-          .map((ref) => `${ref.name || ref.resource_id}${ref.quantity ? ` x ${ref.quantity}` : ""}`)
-          .join(", ")}]`
-      );
-    }
-    if (node.notes) lines.push(`- Notes: ${node.notes}`);
+    normalizePerspectives(node.perspectives).forEach((perspective) => {
+      lines.push(`- Perspective (${perspective.label || "Note"}): ${perspective.text}`);
+    });
     lines.push("");
   });
   lines.push("---");
@@ -3460,53 +4646,73 @@ function generateMarkdown() {
       .map((flow) => `${flow.name || "Unnamed flow"} [${ontologyLabel("flow_types", flow.kind)}${flow.quantity ? `, qty ${flow.quantity}` : ""}${flow.unit ? ` ${flow.unit}` : ""}]`)
       .join("; ");
     lines.push(`- ${from} -> ${to} | ${ontologyLabel("edge_types", edge.type)}${condition}${flows ? ` | Flows: ${flows}` : ""}`);
+    normalizePerspectives(edge.perspectives).forEach((perspective) => {
+      lines.push(`  - Perspective (${perspective.label || "Note"}): ${perspective.text}`);
+    });
   });
-  lines.push("");
-  lines.push("---");
-  lines.push("");
-  lines.push("## Resources");
-  lines.push("");
-  graph.resources.forEach((resource) => {
-    lines.push(`- ${resource.id}: ${resource.name} (${resource.type})`);
-  });
-  if (!graph.resources.length) lines.push("- None");
   lines.push("");
   lines.push("---");
   lines.push("");
   lines.push("## Constraints");
   lines.push("");
   graph.constraints.forEach((constraint) => {
-    lines.push(`- ${constraint.id}: ${ontologyLabel("constraint_types", constraint.type)} - ${constraint.expression || constraintExpression(constraint) || "TBD"}`);
+    lines.push(`- ${constraint.id}: ${ontologyLabel("constraint_types", constraint.type)} - ${constraint.expression || "TBD"}`);
   });
   if (!graph.constraints.length) lines.push("- None");
   lines.push("");
   lines.push("---");
   lines.push("");
-  lines.push("## Assumptions");
+  if (graph.assumptions.length) {
+    lines.push("## Assumptions");
+    lines.push("");
+    graph.assumptions.forEach((assumption) => {
+      lines.push(`- ${assumption.text}`);
+    });
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+  }
+  if (openQuestions.length) {
+    lines.push("## Open Questions");
+    lines.push("");
+    openQuestions.forEach((question) => lines.push(`- ${question}`));
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+  }
+  lines.push("## Validation");
   lines.push("");
-  graph.assumptions.forEach((assumption) => {
-    lines.push(`- ${assumption.id}: ${assumption.text}`);
-  });
-  if (!graph.assumptions.length) lines.push("- None");
+  const errorCount = validation.filter((item) => item.level === "error").length;
+  const warningCount = validation.filter((item) => item.level === "warn").length;
+  lines.push(`- Errors: ${errorCount}`);
+  lines.push(`- Warnings: ${warningCount}`);
+  if (validation.length) {
+    validation.forEach((item) => lines.push(`- [${item.level}] ${item.title} - ${item.detail}`));
+  } else {
+    lines.push("- No issues");
+  }
   lines.push("");
   lines.push("---");
   lines.push("");
-  lines.push("## Open Questions");
+  lines.push("## Handoff Readiness");
   lines.push("");
-  openQuestions.forEach((question) => lines.push(`- ${question}`));
-  if (!openQuestions.length) lines.push("- None");
+  lines.push("_A summary/proposal for downstream tools, not a guarantee._");
   lines.push("");
-  lines.push("---");
-  lines.push("");
-  lines.push("## Validation Status");
-  lines.push("");
-  lines.push(`- Errors: ${validation.filter((item) => item.level === "error").length}`);
-  lines.push(`- Warnings: ${validation.filter((item) => item.level === "warn").length}`);
-  validation.forEach((item) => lines.push(`- ${item.level.toUpperCase()}: ${item.title} - ${item.detail}`));
-  if (!validation.length) lines.push("- Structure complete");
+  lines.push(`- Structure complete: ${errorCount === 0 ? "yes" : "no"}`);
+  lines.push(`- Errors: ${errorCount}`);
+  lines.push(`- Warnings: ${warningCount}`);
   lines.push("");
   lines.push("---");
   lines.push("");
+  const savedViews = Array.isArray(graph.saved_views) ? graph.saved_views : [];
+  if (savedViews.length) {
+    lines.push("## Saved Views");
+    lines.push("");
+    savedViews.forEach((view) => lines.push(`- ${view.name || view.id}`));
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+  }
   lines.push("## Ontology");
   lines.push("");
   Object.entries(graph.ontology || {}).forEach(([group, entries]) => {
@@ -3538,6 +4744,55 @@ function generateMarkdown() {
   lines.push("");
   lines.push("---");
   lines.push("");
+  lines.push("## Design Space");
+  lines.push("");
+  const space = buildDesignSpace(graph);
+  const describeDomain = (domain) => {
+    if (!domain) return "";
+    if (domain.kind === "range") {
+      const span = [domain.min, domain.max].filter((v) => v !== undefined && v !== null && v !== "").join(" to ");
+      return `range ${span}${domain.step ? ` step ${domain.step}` : ""}${domain.unit ? ` ${domain.unit}` : ""}`.trim();
+    }
+    if (domain.kind === "enum") return `one of {${(domain.options || []).join(", ")}}`;
+    if (domain.kind === "boolean") return "on/off";
+    return domain.kind || "";
+  };
+  const qty = (q) => (q ? `${q.value ?? ""}${q.unit ? ` ${q.unit}` : ""}`.trim() : "");
+  if (!space.variables.length && !space.objectives.length && !space.budgets.length && !space.notes) {
+    lines.push("- None defined");
+  } else {
+    lines.push("### Decision variables");
+    if (space.variables.length) {
+      space.variables.forEach((variable) => {
+        if (variable.kind === "parameter") lines.push(`- parameter: ${variable.target}${variable.domain ? ` — ${describeDomain(variable.domain)}` : ""}`);
+        else if (variable.kind === "node_variant") lines.push(`- node variant: ${variable.base} → {${(variable.options || []).join(", ")}}`);
+        else if (variable.kind === "flow_move") lines.push(`- flow move: ${variable.target} — ${(variable.moves || []).join(", ")}`);
+      });
+    } else {
+      lines.push("- None");
+    }
+    lines.push("");
+    lines.push("### Objectives");
+    if (space.objectives.length) {
+      space.objectives.forEach((objective) => lines.push(`- ${objective.metric}${objective.direction ? ` (${objective.direction})` : ""}${objective.kind ? ` [${objective.kind}]` : ""}`));
+    } else {
+      lines.push("- None");
+    }
+    lines.push("");
+    lines.push("### Budgets");
+    if (space.budgets.length) {
+      space.budgets.forEach((budgetItem) => lines.push(`- ${budgetItem.metric}: ${qty(budgetItem.limit)}`));
+    } else {
+      lines.push("- None");
+    }
+    if (space.notes) {
+      lines.push("");
+      lines.push(`Notes: ${space.notes}`);
+    }
+  }
+  lines.push("");
+  lines.push("---");
+  lines.push("");
   lines.push("## Graph JSON");
   lines.push("");
   lines.push("```json");
@@ -3546,8 +4801,50 @@ function generateMarkdown() {
   return lines.join("\n");
 }
 
-function exportEnvelope() {
+function snakeCaseNotationProfile(profile) {
+  if (!profile) return profile;
   return {
+    label: profile.label,
+    short_label: profile.shortLabel,
+    summary: profile.summary,
+    references: profile.references,
+    port_shape: profile.portShape,
+    node_legend: profile.nodeLegend,
+    edge_legend: profile.edgeLegend,
+  };
+}
+
+// Derives a handoff-readiness summary from the current validation run.
+// This is a PROPOSAL/summary for downstream solver/agent tools, not a
+// guarantee that the graph is correct or solvable (P2-3).
+function computeHandoffReadiness() {
+  const items = validateGraph().items;
+  const errorCount = items.filter((item) => item.level === "error").length;
+  const warningCount = items.filter((item) => item.level === "warn").length;
+  return {
+    structure_complete: errorCount === 0,
+    error_count: errorCount,
+    warning_count: warningCount,
+    open_questions: openQuestions.slice(),
+    assumptions_count: (graph.assumptions || []).length,
+    validation: items,
+  };
+}
+
+function exportEnvelope() {
+  const exportedAt = new Date().toISOString();
+  const validation = validateGraph().items;
+  return {
+    // Future-ready envelope metadata (P0-0). The envelope is NOT validated
+    // by the graph schema, so these extra fields are safe to carry.
+    artifact_id: "art_" + Date.now(),
+    schema_version: SCHEMA_VERSION,
+    graph_version: graph.version,
+    created_by: graph.metadata?.created_by || "user",
+    created_at: graph.metadata?.created_at || exportedAt,
+    updated_at: exportedAt,
+    // Core artifact: most downstream-tool inputs ride along inside `graph`
+    // (ontology, assumptions, open_questions, versions, saved_views).
     graph,
     layout,
     selected,
@@ -3555,9 +4852,16 @@ function exportEnvelope() {
     open_questions: openQuestions,
     chat_messages: chatMessages,
     ontology: graph.ontology,
-    notation_profile: currentNotationProfile(),
-    validation: validateGraph().items,
-    exported_at: new Date().toISOString(),
+    assumptions: graph.assumptions,
+    versions: graph.versions || [],
+    saved_views: graph.saved_views,
+    // DS-3: the flattened design-space handoff artifact (derived variables +
+    // authored objectives/budgets/notes). Computed at export time.
+    design_space: buildDesignSpace(graph),
+    notation_profile: snakeCaseNotationProfile(currentNotationProfile()),
+    validation,
+    handoff_readiness: computeHandoffReadiness(),
+    exported_at: exportedAt,
   };
 }
 
@@ -3576,7 +4880,7 @@ function downloadMarkdown() {
 }
 
 function downloadGraphJson() {
-  const json = JSON.stringify(exportEnvelope(), null, 2);
+  const json = graphJsonText();
   const blob = new Blob([json], { type: "application/json;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -3589,8 +4893,247 @@ function downloadGraphJson() {
   toast("Graph JSON exported");
 }
 
+function graphJsonText() {
+  return JSON.stringify(exportEnvelope(), null, 2);
+}
+
+function graphFilePickerTypes() {
+  return [
+    {
+      description: "Process graph JSON",
+      accept: { "application/json": [".json"] },
+    },
+  ];
+}
+
+function supportsOpenFilePicker() {
+  return typeof window.showOpenFilePicker === "function";
+}
+
+function supportsSaveFilePicker() {
+  return typeof window.showSaveFilePicker === "function";
+}
+
+function clearCurrentFileHandle() {
+  currentFileHandle = null;
+  currentFileName = "";
+  updateFileAccessUi();
+}
+
+function updateCurrentFileHandle(fileHandle, fileName) {
+  currentFileHandle = fileHandle || null;
+  currentFileName = fileHandle?.name || fileName || "";
+  updateFileAccessUi();
+}
+
+function updateFileAccessUi() {
+  if (els.fileSaveStatus) {
+    els.fileSaveStatus.textContent = currentFileHandle
+      ? `Opened file: ${currentFileName || "JSON file"}`
+      : "No opened file";
+  }
+  if (els.saveToOpenedFileButton) {
+    els.saveToOpenedFileButton.disabled = !currentFileHandle;
+    els.saveToOpenedFileButton.title = currentFileHandle
+      ? `Save to ${currentFileName || "the opened JSON file"}`
+      : "Open a JSON file first";
+  }
+  if (els.saveAsFileButton) {
+    els.saveAsFileButton.title = supportsSaveFilePicker()
+      ? "Choose a JSON file path"
+      : "Exports JSON as a download in this browser";
+  }
+  if (els.openFilePickerButton) {
+    els.openFilePickerButton.title = supportsOpenFilePicker()
+      ? "Open a JSON file for save-back editing"
+      : "Imports JSON in this browser";
+  }
+}
+
+async function openGraphFileWithPicker() {
+  if (!supportsOpenFilePicker()) {
+    els.importFileInput.click();
+    toast("Opened the import picker");
+    return;
+  }
+  try {
+    const [handle] = await window.showOpenFilePicker({
+      multiple: false,
+      types: graphFilePickerTypes(),
+      excludeAcceptAllOption: false,
+    });
+    if (!handle) return;
+    const file = await handle.getFile();
+    const imported = await importGraphFromFile(file, { fileHandle: handle });
+    if (imported) closeLibrary();
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+    console.warn("Unable to open JSON file", error);
+    toast("Could not open JSON file");
+  }
+}
+
+async function requestWritableFilePermission(fileHandle) {
+  if (!fileHandle) return false;
+  const options = { mode: "readwrite" };
+  if (typeof fileHandle.queryPermission === "function") {
+    const current = await fileHandle.queryPermission(options);
+    if (current === "granted") return true;
+  }
+  if (typeof fileHandle.requestPermission === "function") {
+    return (await fileHandle.requestPermission(options)) === "granted";
+  }
+  return true;
+}
+
+async function writeGraphToFileHandle(fileHandle) {
+  const hasPermission = await requestWritableFilePermission(fileHandle);
+  if (!hasPermission) {
+    toast("File write permission was not granted");
+    return false;
+  }
+  const writable = await fileHandle.createWritable();
+  await writable.write(graphJsonText());
+  await writable.close();
+  updateCurrentFileHandle(fileHandle);
+  saveState();
+  return true;
+}
+
+async function saveGraphToOpenedFile() {
+  if (!currentFileHandle) {
+    toast("Open a JSON file first");
+    updateFileAccessUi();
+    return;
+  }
+  try {
+    const saved = await writeGraphToFileHandle(currentFileHandle);
+    if (saved) toast(`Saved ${currentFileName || "JSON file"}`);
+  } catch (error) {
+    console.warn("Unable to save opened JSON file", error);
+    toast("Could not save opened file");
+  }
+}
+
+async function saveGraphAsFile() {
+  if (!supportsSaveFilePicker()) {
+    downloadGraphJson();
+    return;
+  }
+  try {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: `${slug(graph.name) || "process-graph"}.json`,
+      types: graphFilePickerTypes(),
+      excludeAcceptAllOption: false,
+    });
+    const saved = await writeGraphToFileHandle(handle);
+    if (saved) {
+      toast(`Saved ${currentFileName || "JSON file"}`);
+      closeSaveDialog();
+    }
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+    console.warn("Unable to save JSON file", error);
+    toast("Could not save JSON file");
+  }
+}
+
+// DS-3: download just the design_space artifact (derived variables + authored
+// objectives/budgets/notes), reusing the blob/anchor pattern above.
+function downloadDesignSpaceJson() {
+  const json = JSON.stringify(buildDesignSpace(graph), null, 2);
+  const blob = new Blob([json], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${slug(graph.name) || "process-graph"}.design_space.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  toast("Design space exported");
+}
+
+// Reads an envelope field by its snake_case wire key, with a camelCase
+// fallback so files written by either exportEnvelope (snake_case) or a
+// localStorage-shaped object (camelCase) both restore correctly.
+function readEnvelopeField(env, snakeKey, camelKey, fallback) {
+  if (env[snakeKey] !== undefined) return env[snakeKey];
+  if (env[camelKey] !== undefined) return env[camelKey];
+  return fallback;
+}
+
+async function importGraphFromFile(file, options = {}) {
+  let parsed;
+  try {
+    const text = await file.text();
+    parsed = JSON.parse(text);
+  } catch (error) {
+    console.warn("Unable to read imported JSON file", error);
+    toast("Could not read JSON file");
+    return false;
+  }
+
+  // Accept either a full export envelope ({ graph, layout, ... }) or a bare
+  // graph object ({ nodes, edges, ... }).
+  const isEnvelope = parsed && typeof parsed === "object" && parsed.graph && typeof parsed.graph === "object";
+  const env = isEnvelope ? parsed : { graph: parsed };
+  const importedGraph = env.graph;
+
+  if (!importedGraph || typeof importedGraph !== "object" || (!Array.isArray(importedGraph.nodes) && !Array.isArray(importedGraph.edges))) {
+    toast("File does not contain a valid graph");
+    return false;
+  }
+
+  graph = importedGraph;
+  layout = (env.layout && typeof env.layout === "object") ? env.layout : {};
+  selected = env.selected || selected;
+  mutationLog = readEnvelopeField(env, "mutation_log", "mutationLog", []) || [];
+  openQuestions = readEnvelopeField(env, "open_questions", "openQuestions", []) || [];
+  const importedChat = readEnvelopeField(env, "chat_messages", "chatMessages", []);
+  chatMessages = Array.isArray(importedChat) ? importedChat : [];
+  const importedAllowCycles = readEnvelopeField(env, "allow_cycles", "allowCycles", undefined);
+  if (importedAllowCycles !== undefined) {
+    allowCycles = Boolean(importedAllowCycles);
+  }
+  const importedView = readEnvelopeField(env, "canvas_view", "canvasView", undefined);
+  if (importedView) {
+    canvasView = normalizeCanvasView(importedView);
+  }
+
+  // Clear transient plan/clarification state, mirroring loadState/resetGraph.
+  pendingPlan = null;
+  clarificationContext = null;
+  undoStack = [];
+
+  ensureGraphShape();
+  // An imported graph carries its own saved_views; the prior activeViewId
+  // (from a different graph) no longer applies.
+  const importedViewId = readEnvelopeField(env, "active_view_id", "activeViewId", null);
+  activeViewId = graph.saved_views.some((view) => view.id === importedViewId) ? importedViewId : null;
+  const hadLayout = Object.keys(layout).length > 0;
+  normalizeLayout();
+  if (!hadLayout) {
+    // No layout in the file: derive a hierarchical layout instead of the
+    // plain grid fallback from normalizeLayout.
+    autoLayoutGraph();
+  }
+  renderPlan();
+  render();
+  if (options.fileHandle) {
+    updateCurrentFileHandle(options.fileHandle, file.name);
+    toast(`Opened ${currentFileName || file.name || "JSON file"}`);
+  } else if (options.clearFileHandle) {
+    clearCurrentFileHandle();
+    toast("Graph imported");
+  } else {
+    toast("Graph imported");
+  }
+  return true;
+}
+
 async function copyGraphJson() {
-  const text = JSON.stringify(exportEnvelope(), null, 2);
+  const text = graphJsonText();
   try {
     await navigator.clipboard.writeText(text);
     toast("Graph JSON copied");
@@ -3602,22 +5145,66 @@ async function copyGraphJson() {
 function resetGraph() {
   graph = clone(sampleGraph);
   layout = clone(sampleLayout);
-  selected = { kind: "node", id: "n_request_complete" };
+  selected = { kind: "node", id: "n_machining" };
   pendingPlan = null;
   mutationLog = [];
   openQuestions = [];
   allowCycles = true;
+  validateCurrentView = false;
   addNodeFormOpen = false;
-  addEdgeFormOpen = false;
-  resourcesOpen = false;
-  constraintsOpen = false;
+  legendCollapsed = false;
   chatMessages = [];
   undoStack = [];
   clarificationContext = null;
   canvasView = { x: 0, y: 0, zoom: 1 };
+  activeFilter = createEmptyFilter();
+  activeViewId = null;
   renderPlan();
   render();
   toast("Sample graph restored");
+}
+
+function blankGraph() {
+  return {
+    id: "pg_untitled",
+    name: "Untitled Process Graph",
+    version: "0.1.0",
+    description: "",
+    modeling_style: graph.modeling_style || "none",
+    nodes: [],
+    edges: [],
+    resources: [],
+    constraints: [],
+    assumptions: [],
+    open_questions: [],
+    chat_messages: [],
+    versions: [],
+    ontology: clone(DEFAULT_ONTOLOGY),
+    metadata: { created_by: "user", created_at: new Date().toISOString(), tags: [] },
+  };
+}
+
+function clearGraph() {
+  if (!window.confirm("Clear the canvas? This removes all nodes, edges, and constraints from the current graph. Save it to the Library first if you want to keep it.")) {
+    return;
+  }
+  graph = blankGraph();
+  layout = {};
+  selected = { kind: null, id: null };
+  pendingPlan = null;
+  mutationLog = [];
+  openQuestions = [];
+  chatMessages = [];
+  undoStack = [];
+  clarificationContext = null;
+  canvasView = { x: 0, y: 0, zoom: 1 };
+  activeFilter = createEmptyFilter();
+  activeViewId = null;
+  validateCurrentView = false;
+  legendCollapsed = false;
+  renderPlan();
+  render();
+  toast("Canvas cleared");
 }
 
 function createNode(payload) {
@@ -3629,11 +5216,20 @@ function createNode(payload) {
     inputs: Array.isArray(payload.inputs) ? payload.inputs : [],
     outputs: Array.isArray(payload.outputs) ? payload.outputs : [],
     resources_required: normalizeResourceRequirements(payload.resources_required || []),
-    attributes: payload.attributes || {},
+    // DS-1: attribute values may be plain strings OR quantitative parameter objects.
+    attributes: normalizePropertyStore(payload.attributes),
     description: typeof payload.description === "string" ? payload.description : "",
     description_status: normalizeNodeDescriptionStatus(payload.description_status, payload.description || ""),
+    perspectives: normalizePerspectives(payload.perspectives),
     notes: payload.notes || "",
   };
+  // DS-5: node variant tagging + adoption cost/time (optional).
+  if (typeof payload.variant_of === "string" && payload.variant_of.trim()) {
+    node.variant_of = payload.variant_of.trim();
+    node.adoption = normalizeAdoption(payload.adoption);
+  } else if (payload.adoption && typeof payload.adoption === "object") {
+    node.adoption = normalizeAdoption(payload.adoption);
+  }
   if (!node.description) {
     node.description = suggestNodeDescription(node, graph);
     node.description_status = "suggested";
@@ -3723,19 +5319,537 @@ function createEdge(payload) {
   const type = normalizeEdgeType(payload.type);
   const explicitFlows = Array.isArray(payload.flows) ? normalizeFlows(payload.flows) : [];
   const flows = explicitFlows.length || type !== "flow" ? explicitFlows : inferEdgeFlowsFromNodes(payload);
-  return {
+  const edge = {
     id: payload.id || uniqueId(`e_${slug(payload.from_node)}_${slug(payload.to_node)}`),
     from_node: payload.from_node,
     to_node: payload.to_node,
     type,
     condition: payload.condition || "",
     flows,
+    resources_required: normalizeResourceRequirements(payload.resources_required || []),
+    // DS-1: property values may be plain strings OR quantitative parameter objects.
+    properties: normalizePropertyStore(payload.properties),
+    perspectives: normalizePerspectives(payload.perspectives),
+    description: typeof payload.description === "string" ? payload.description : "",
+    description_status: normalizeDefinitionStatus(payload.description_status, payload.description || ""),
   };
+  // DS-7: edge change-moves (reroutable / eliminable + cost/time), optional.
+  const change = normalizeChange(payload.change);
+  if (change) edge.change = change;
+  return edge;
+}
+
+// A perspective is a labeled description block: { label, text }. snake_case on the wire.
+function normalizePerspectives(perspectives) {
+  return (Array.isArray(perspectives) ? perspectives : [])
+    .map((perspective) => ({
+      label: typeof perspective?.label === "string" ? perspective.label : "",
+      text: typeof perspective?.text === "string" ? perspective.text : "",
+    }))
+    .filter((perspective) => perspective.label || perspective.text);
+}
+
+// Shared definition-status normalizer for edges/resources/constraints (mirrors node statuses).
+function normalizeDefinitionStatus(status, description = "") {
+  if (NODE_DESCRIPTION_STATUSES.includes(status)) return status;
+  return description ? "custom" : "empty";
+}
+
+// --- Design-space element annotations (DS-1/5/6/7) -------------------------
+// All additive/optional. A graph without these fields is unchanged.
+
+const UNCERTAINTY_KINDS = ["range", "plus_minus", "confidence", "distribution"];
+const VARIABLE_KINDS = ["range", "enum", "boolean"];
+
+// DS-1 KEYSTONE. A property value is EITHER a plain string (default) OR a
+// quantitative parameter object { value, unit, uncertainty?, variable? }.
+// normalizePropertyValue keeps strings as strings and normalizes objects so
+// object-valued attributes/properties survive load/save (never stringified).
+function normalizePropertyValue(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return normalizeParameter(value);
+  }
+  return String(value ?? "");
+}
+
+function isParameterValue(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function normalizeParameter(param) {
+  const source = param && typeof param === "object" ? param : {};
+  const result = { value: source.value !== undefined && source.value !== null ? String(source.value) : "" };
+  if (source.unit !== undefined && source.unit !== null && String(source.unit) !== "") {
+    result.unit = String(source.unit);
+  }
+  const uncertainty = normalizeUncertainty(source.uncertainty);
+  if (uncertainty) result.uncertainty = uncertainty;
+  const variable = normalizeVariable(source.variable);
+  if (variable) result.variable = variable;
+  return result;
+}
+
+function normalizeUncertainty(unc) {
+  if (!unc || typeof unc !== "object") return null;
+  const kind = UNCERTAINTY_KINDS.includes(unc.kind) ? unc.kind : "range";
+  const out = { kind };
+  const num = (v) => (v !== undefined && v !== null && String(v) !== "" ? String(v) : undefined);
+  if (kind === "range") {
+    if (num(unc.low) !== undefined) out.low = num(unc.low);
+    if (num(unc.high) !== undefined) out.high = num(unc.high);
+  } else if (kind === "plus_minus") {
+    if (num(unc.plus_minus) !== undefined) out.plus_minus = num(unc.plus_minus);
+    if (unc.percent !== undefined) out.percent = Boolean(unc.percent);
+  } else if (kind === "confidence") {
+    if (num(unc.confidence) !== undefined) out.confidence = num(unc.confidence);
+    if (num(unc.low) !== undefined) out.low = num(unc.low);
+    if (num(unc.high) !== undefined) out.high = num(unc.high);
+  } else if (kind === "distribution") {
+    if (unc.distribution !== undefined && unc.distribution !== null && String(unc.distribution) !== "") {
+      out.distribution = String(unc.distribution);
+    }
+    if (num(unc.mean) !== undefined) out.mean = num(unc.mean);
+    if (num(unc.std) !== undefined) out.std = num(unc.std);
+  }
+  return out;
+}
+
+function normalizeVariable(variable) {
+  if (!variable || typeof variable !== "object") return null;
+  const kind = VARIABLE_KINDS.includes(variable.kind) ? variable.kind : "range";
+  const out = { kind };
+  const num = (v) => (v !== undefined && v !== null && String(v) !== "" ? String(v) : undefined);
+  if (kind === "range") {
+    if (num(variable.min) !== undefined) out.min = num(variable.min);
+    if (num(variable.max) !== undefined) out.max = num(variable.max);
+    if (num(variable.step) !== undefined) out.step = num(variable.step);
+    if (variable.unit !== undefined && variable.unit !== null && String(variable.unit) !== "") out.unit = String(variable.unit);
+  } else if (kind === "enum") {
+    out.options = Array.isArray(variable.options)
+      ? variable.options.map((opt) => String(opt)).filter((opt) => opt !== "")
+      : [];
+  }
+  // boolean: nothing extra
+  return out;
+}
+
+// Normalize a property store ({ key: string | parameter-object }), preserving
+// object-valued parameters. Used by createNode/createEdge/ensureGraphShape.
+function normalizePropertyStore(store) {
+  if (!store || typeof store !== "object") return {};
+  const out = {};
+  Object.entries(store).forEach(([key, value]) => {
+    out[key] = normalizePropertyValue(value);
+  });
+  return out;
+}
+
+// A small quantity { value, unit } (used by adoption cost/time, flow value/cost,
+// edge change cost/time). Returns null when both are empty so we don't persist
+// empty objects.
+function normalizeQuantity(quantity) {
+  if (!quantity || typeof quantity !== "object") return null;
+  const value = quantity.value !== undefined && quantity.value !== null ? String(quantity.value) : "";
+  const unit = quantity.unit !== undefined && quantity.unit !== null ? String(quantity.unit) : "";
+  if (value === "" && unit === "") return null;
+  const out = { value };
+  if (unit !== "") out.unit = unit;
+  return out;
+}
+
+// DS-5: node adoption cost/time for a variant. Always returns an object shape
+// (cost/time present, possibly empty) so the editor inputs bind cleanly.
+function normalizeAdoption(adoption) {
+  const source = adoption && typeof adoption === "object" ? adoption : {};
+  return {
+    cost: normalizeQuantity(source.cost) || { value: "" },
+    time: normalizeQuantity(source.time) || { value: "" },
+  };
+}
+
+// DS-7: edge change-moves. Returns null when nothing meaningful is set.
+function normalizeChange(change) {
+  if (!change || typeof change !== "object") return null;
+  const out = {
+    reroutable: Boolean(change.reroutable),
+    eliminable: Boolean(change.eliminable),
+  };
+  const cost = normalizeQuantity(change.cost);
+  if (cost) out.cost = cost;
+  const time = normalizeQuantity(change.time);
+  if (time) out.time = time;
+  if (typeof change.notes === "string" && change.notes.trim()) out.notes = change.notes;
+  return out;
+}
+
+// --- Design space (DS-2 authoring + DS-3 build/export) ---------------------
+// graph.design_space holds the AUTHORED set only: objectives, budgets, notes.
+// Decision variables are DERIVED from element annotations at build time
+// (buildDesignSpace) and are NOT stored here.
+
+const OBJECTIVE_DIRECTIONS = ["max", "min"];
+const OBJECTIVE_KINDS = ["objective", "hard_constraint", "soft_constraint"];
+
+// DS-2: default/clean the authored design_space stored on the graph.
+function normalizeDesignSpace(designSpace) {
+  const source = designSpace && typeof designSpace === "object" ? designSpace : {};
+  return {
+    objectives: Array.isArray(source.objectives) ? source.objectives.map(normalizeObjective) : [],
+    budgets: Array.isArray(source.budgets) ? source.budgets.map(normalizeBudget) : [],
+    notes: typeof source.notes === "string" ? source.notes : "",
+  };
+}
+
+function normalizeObjective(objective) {
+  const source = objective && typeof objective === "object" ? objective : {};
+  const out = { metric: typeof source.metric === "string" ? source.metric : "" };
+  if (OBJECTIVE_DIRECTIONS.includes(source.direction)) out.direction = source.direction;
+  out.kind = OBJECTIVE_KINDS.includes(source.kind) ? source.kind : "objective";
+  if (typeof source.notes === "string" && source.notes.trim()) out.notes = source.notes;
+  return out;
+}
+
+function normalizeBudget(budget) {
+  const source = budget && typeof budget === "object" ? budget : {};
+  const out = { metric: typeof source.metric === "string" ? source.metric : "" };
+  const limit = normalizeQuantity(source.limit);
+  out.limit = limit || { value: "" };
+  if (typeof source.notes === "string" && source.notes.trim()) out.notes = source.notes;
+  return out;
+}
+
+// DS-3: derive the decision variables from the graph annotations. NOT stored.
+function buildDesignSpaceVariables(graph) {
+  const variables = [];
+
+  // parameter variables: any node attribute / edge property whose value is a
+  // parameter object carrying a `.variable` decision domain.
+  const collectParameters = (elementId, store) => {
+    if (!store || typeof store !== "object") return;
+    Object.entries(store).forEach(([key, value]) => {
+      if (isParameterValue(value) && value.variable) {
+        const ref = {
+          kind: "parameter",
+          target: `${elementId}.${key}`,
+          domain: value.variable,
+        };
+        if (value.uncertainty) ref.uncertainty = value.uncertainty;
+        variables.push(ref);
+      }
+    });
+  };
+  (graph.nodes || []).forEach((node) => collectParameters(node.id, node.attributes));
+  (graph.edges || []).forEach((edge) => collectParameters(edge.id, edge.properties));
+
+  // node_variant variables: group nodes by variant_of; each base with >=1 variant.
+  const variantsByBase = new Map();
+  (graph.nodes || []).forEach((node) => {
+    if (typeof node.variant_of === "string" && node.variant_of) {
+      if (!variantsByBase.has(node.variant_of)) variantsByBase.set(node.variant_of, []);
+      variantsByBase.get(node.variant_of).push(node);
+    }
+  });
+  variantsByBase.forEach((variantNodes, baseId) => {
+    const ref = {
+      kind: "node_variant",
+      base: baseId,
+      options: [baseId, ...variantNodes.map((node) => node.id)],
+    };
+    // Adoption: take the first variant carrying a meaningful adoption cost/time.
+    const withAdoption = variantNodes.find((node) => {
+      const cost = node.adoption?.cost;
+      const time = node.adoption?.time;
+      return (cost && cost.value !== "" && cost.value !== undefined) || (time && time.value !== "" && time.value !== undefined);
+    });
+    if (withAdoption) ref.adoption = withAdoption.adoption;
+    variables.push(ref);
+  });
+
+  // flow_move variables: edges flagged reroutable and/or eliminable.
+  (graph.edges || []).forEach((edge) => {
+    const change = edge.change;
+    if (!change || typeof change !== "object") return;
+    const moves = [];
+    if (change.reroutable) moves.push("reroute");
+    if (change.eliminable) moves.push("eliminate");
+    if (!moves.length) return;
+    variables.push({ kind: "flow_move", target: edge.id, moves, change });
+  });
+
+  return variables;
+}
+
+// DS-3: assemble the full design_space handoff artifact.
+function buildDesignSpace(graph) {
+  const authored = normalizeDesignSpace(graph.design_space);
+  const designSpace = {
+    id: graph.id ? `ds-${graph.id}` : `ds-${slug(graph.name) || "design-space"}`,
+    name: graph.name ? `${graph.name} design space` : "Design space",
+    base_graph_id: graph.id || "",
+    variables: buildDesignSpaceVariables(graph),
+    objectives: authored.objectives,
+    budgets: authored.budgets,
+  };
+  if (authored.notes && authored.notes.trim()) designSpace.notes = authored.notes;
+  return designSpace;
+}
+
+// --- Design-space dialog (DS-2 authoring UI) -------------------------------
+
+function openDesignSpaceDialog() {
+  renderDesignSpaceDialog();
+  showDialog(els.designSpaceDialog);
+}
+
+function closeDesignSpaceDialog() {
+  hideDialog(els.designSpaceDialog);
+}
+
+function renderDesignSpaceDialog() {
+  renderDesignSpaceVariables();
+  renderDesignSpaceObjectives();
+  renderDesignSpaceBudgets();
+  if (els.designSpaceNotes) els.designSpaceNotes.value = graph.design_space.notes || "";
+}
+
+function describeDesignSpaceVariable(variable) {
+  if (variable.kind === "parameter") {
+    const domain = variable.domain || {};
+    let domainText = domain.kind || "";
+    if (domain.kind === "range") {
+      const parts = [domain.min, domain.max].filter((v) => v !== undefined && v !== "");
+      domainText = `range ${parts.join("–")}${domain.step ? ` step ${domain.step}` : ""}${domain.unit ? ` ${domain.unit}` : ""}`.trim();
+    } else if (domain.kind === "enum") {
+      domainText = `enum [${(domain.options || []).join(", ")}]`;
+    } else if (domain.kind === "boolean") {
+      domainText = "boolean";
+    }
+    return { tag: "parameter", target: variable.target, summary: domainText };
+  }
+  if (variable.kind === "node_variant") {
+    return {
+      tag: "node_variant",
+      target: variable.base,
+      summary: `${(variable.options || []).length} options (base + variants)`,
+    };
+  }
+  if (variable.kind === "flow_move") {
+    return { tag: "flow_move", target: variable.target, summary: (variable.moves || []).join(" / ") };
+  }
+  return { tag: variable.kind || "variable", target: "", summary: "" };
+}
+
+function renderDesignSpaceVariables() {
+  if (!els.designSpaceVariables) return;
+  const variables = buildDesignSpaceVariables(graph);
+  if (!variables.length) {
+    els.designSpaceVariables.innerHTML = `<div class="type-help">Mark a property variable, add a node variant, or flag an edge reroutable/eliminable to populate this.</div>`;
+    return;
+  }
+  els.designSpaceVariables.innerHTML = variables
+    .map((variable) => {
+      const view = describeDesignSpaceVariable(variable);
+      return (
+        `<div class="ds-variable-row">` +
+        `<span class="ds-variable-tag">${escapeHtml(view.tag)}</span>` +
+        `<span class="ds-variable-target">${escapeHtml(view.target)}</span>` +
+        `<span class="ds-variable-summary">${escapeHtml(view.summary)}</span>` +
+        `</div>`
+      );
+    })
+    .join("");
+}
+
+function objectiveDirectionOptions(selected) {
+  return [
+    `<option value="">—</option>`,
+    ...OBJECTIVE_DIRECTIONS.map(
+      (dir) => `<option value="${dir}"${selected === dir ? " selected" : ""}>${escapeHtml(dir)}</option>`
+    ),
+  ].join("");
+}
+
+function objectiveKindOptions(selected) {
+  return OBJECTIVE_KINDS.map(
+    (kind) => `<option value="${kind}"${selected === kind ? " selected" : ""}>${escapeHtml(titleCase(kind))}</option>`
+  ).join("");
+}
+
+function renderDesignSpaceObjectives() {
+  if (!els.designSpaceObjectives) return;
+  const objectives = graph.design_space.objectives || [];
+  const rows = objectives
+    .map(
+      (objective, index) => `
+        <div class="ds-row" data-objective-index="${index}">
+          <input type="text" class="ds-metric" data-objective-field="metric" value="${escapeAttribute(objective.metric || "")}" placeholder="margin_gain / feasibility / uncertainty / throughput / change_cost / change_time" aria-label="Objective metric" />
+          <select class="ds-select" data-objective-field="direction" aria-label="Objective direction">${objectiveDirectionOptions(objective.direction)}</select>
+          <select class="ds-select" data-objective-field="kind" aria-label="Objective kind">${objectiveKindOptions(objective.kind)}</select>
+          <button class="icon-button danger" type="button" title="Remove objective" data-delete-objective="${index}">✕</button>
+        </div>
+      `
+    )
+    .join("");
+  const addButton = `<button class="button secondary full" type="button" data-add-objective>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+      Add objective
+    </button>`;
+  els.designSpaceObjectives.innerHTML =
+    (rows || `<div class="type-help">No objectives yet.</div>`) + addButton;
+}
+
+function renderDesignSpaceBudgets() {
+  if (!els.designSpaceBudgets) return;
+  const budgets = graph.design_space.budgets || [];
+  const rows = budgets
+    .map(
+      (budget, index) => `
+        <div class="ds-row" data-budget-index="${index}">
+          <input type="text" class="ds-metric" data-budget-field="metric" value="${escapeAttribute(budget.metric || "")}" placeholder="change_cost / change_time" aria-label="Budget metric" />
+          <input type="text" class="ds-limit-value" data-budget-field="limit_value" value="${escapeAttribute(budget.limit?.value ?? "")}" placeholder="limit" aria-label="Budget limit amount" />
+          <input type="text" class="ds-limit-unit" data-budget-field="limit_unit" value="${escapeAttribute(budget.limit?.unit ?? "")}" placeholder="unit (e.g. USD, wk)" aria-label="Budget limit unit" />
+          <button class="icon-button danger" type="button" title="Remove budget" data-delete-budget="${index}">✕</button>
+        </div>
+      `
+    )
+    .join("");
+  const addButton = `<button class="button secondary full" type="button" data-add-budget>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+      Add budget
+    </button>`;
+  els.designSpaceBudgets.innerHTML =
+    (rows || `<div class="type-help">No budgets yet.</div>`) + addButton;
+}
+
+// design_space is graph-level authoring/UI state, not a graph mutation: edit it
+// directly then saveState() (mirrors how saved_views/ontology persist).
+function handleDesignSpaceObjectiveInput(event) {
+  const field = event.target.dataset.objectiveField;
+  if (!field) return;
+  const row = event.target.closest("[data-objective-index]");
+  if (!row) return;
+  const objective = graph.design_space.objectives[Number(row.dataset.objectiveIndex)];
+  if (!objective) return;
+  if (field === "metric") {
+    objective.metric = event.target.value;
+  } else if (field === "direction") {
+    if (OBJECTIVE_DIRECTIONS.includes(event.target.value)) objective.direction = event.target.value;
+    else delete objective.direction;
+  } else if (field === "kind") {
+    objective.kind = OBJECTIVE_KINDS.includes(event.target.value) ? event.target.value : "objective";
+  }
+  saveState();
+  // Selects (change events) re-render to keep options in sync; text inputs do not.
+  if (field !== "metric") renderDesignSpaceObjectives();
+}
+
+function handleDesignSpaceObjectiveClick(event) {
+  if (event.target.closest("[data-add-objective]")) {
+    graph.design_space.objectives.push(normalizeObjective({}));
+    saveState();
+    renderDesignSpaceObjectives();
+    return;
+  }
+  const deleteButton = event.target.closest("[data-delete-objective]");
+  if (!deleteButton) return;
+  const index = Number(deleteButton.dataset.deleteObjective);
+  if (Number.isNaN(index)) return;
+  graph.design_space.objectives.splice(index, 1);
+  saveState();
+  renderDesignSpaceObjectives();
+}
+
+function handleDesignSpaceBudgetInput(event) {
+  const field = event.target.dataset.budgetField;
+  if (!field) return;
+  const row = event.target.closest("[data-budget-index]");
+  if (!row) return;
+  const budget = graph.design_space.budgets[Number(row.dataset.budgetIndex)];
+  if (!budget) return;
+  if (field === "metric") {
+    budget.metric = event.target.value;
+  } else if (field === "limit_value") {
+    budget.limit = budget.limit && typeof budget.limit === "object" ? budget.limit : { value: "" };
+    budget.limit.value = event.target.value;
+  } else if (field === "limit_unit") {
+    budget.limit = budget.limit && typeof budget.limit === "object" ? budget.limit : { value: "" };
+    if (event.target.value) budget.limit.unit = event.target.value;
+    else delete budget.limit.unit;
+  }
+  saveState();
+  // All budget fields are text inputs — patch in place, preserve focus.
+}
+
+function handleDesignSpaceBudgetClick(event) {
+  if (event.target.closest("[data-add-budget]")) {
+    graph.design_space.budgets.push(normalizeBudget({}));
+    saveState();
+    renderDesignSpaceBudgets();
+    return;
+  }
+  const deleteButton = event.target.closest("[data-delete-budget]");
+  if (!deleteButton) return;
+  const index = Number(deleteButton.dataset.deleteBudget);
+  if (Number.isNaN(index)) return;
+  graph.design_space.budgets.splice(index, 1);
+  saveState();
+  renderDesignSpaceBudgets();
+}
+
+function handleDesignSpaceNotesInput(event) {
+  graph.design_space.notes = event.target.value;
+  saveState();
+}
+
+// Read the edge change-moves section's inputs into a normalized change object
+// (or null when nothing meaningful is set).
+function buildChangeFromInputs() {
+  const read = (field) => els.inspectorContent.querySelector(`[data-edge-change-field="${field}"]`);
+  const raw = {
+    reroutable: read("reroutable")?.checked || false,
+    eliminable: read("eliminable")?.checked || false,
+    cost: { value: read("cost_value")?.value || "", unit: read("cost_unit")?.value || "" },
+    time: { value: read("time_value")?.value || "", unit: read("time_unit")?.value || "" },
+  };
+  return normalizeChange(raw);
+}
+
+// Read the node variant adoption inputs into a normalized adoption object.
+function buildAdoptionFromInputs() {
+  const read = (field) => els.inspectorContent.querySelector(`[data-node-variant-field="${field}"]`);
+  return normalizeAdoption({
+    cost: { value: read("cost_value")?.value || "", unit: read("cost_unit")?.value || "" },
+    time: { value: read("time_value")?.value || "", unit: read("time_unit")?.value || "" },
+  });
+}
+
+// Set or clear a node's variant_of base (and default its adoption). Commits
+// via applyMutation; caller re-renders.
+function applyNodeVariantOf(node, baseId) {
+  const trimmed = (baseId || "").trim();
+  const payload = {};
+  if (trimmed && trimmed !== node.id) {
+    payload.variant_of = trimmed;
+    payload.adoption = node.adoption && typeof node.adoption === "object" ? normalizeAdoption(node.adoption) : normalizeAdoption({});
+  } else {
+    payload.variant_of = "";
+    payload.adoption = null;
+  }
+  applyMutation(
+    {
+      action: "update_node",
+      target_id: node.id,
+      payload,
+      reason: "Inspector updated node variant base",
+      confidence: "high",
+    },
+    { rerender: false, log: false }
+  );
 }
 
 function createFlow(payload) {
   const kind = FLOW_KINDS.includes(payload.kind) ? payload.kind : inferFlowKind(payload.name || "");
-  return {
+  const flow = {
     id: payload.id || uniqueId(`f_${slug(payload.name || kind || "flow")}`),
     name: payload.name || "",
     kind,
@@ -3743,6 +5857,12 @@ function createFlow(payload) {
     unit: payload.unit || "",
     properties: payload.properties || {},
   };
+  // DS-6: flow economics — value/cost as small quantities { value, unit }, optional.
+  const value = normalizeQuantity(payload.value);
+  if (value) flow.value = value;
+  const cost = normalizeQuantity(payload.cost);
+  if (cost) flow.cost = cost;
+  return flow;
 }
 
 function createResource(payload) {
@@ -3751,21 +5871,36 @@ function createResource(payload) {
     name: payload.name || "Resource",
     type: RESOURCE_TYPES.includes(payload.type) ? payload.type : "human",
     attributes: payload.attributes || {},
+    description: typeof payload.description === "string" ? payload.description : "",
+    description_status: normalizeDefinitionStatus(payload.description_status, payload.description || ""),
   };
 }
 
 function createConstraint(payload) {
-  const type = normalizeConstraintType(payload.type);
-  const constraint = {
-    id: payload.id || uniqueId(`c_${slug(payload.type || "constraint")}`),
-    type,
-    fields: payload.fields || migrateConstraintFields(payload),
-    expression: payload.expression || "",
-  };
-  constraint.expression = constraint.expression || constraintExpression(constraint);
   return {
-    ...constraint,
+    id: payload.id || uniqueId(`c_${slug(payload.type || "constraint")}`),
+    type: normalizeConstraintType(payload.type || "policy_rule"),
+    // fields.target is the OWNER element id (the node/edge whose modal it lives in).
+    // Set implicitly when added inside an element editor; no picker.
+    fields: { target: payload.fields?.target || "" },
+    expression: typeof payload.expression === "string" ? payload.expression : "",
+    description: typeof payload.description === "string" ? payload.description : "",
+    description_status: normalizeDefinitionStatus(payload.description_status, payload.description || ""),
   };
+}
+
+// Best-effort owner for a constraint with no/stale fields.target: the longest
+// node name (then edge id) that appears in the constraint text.
+function resolveConstraintOwnerFromText(text) {
+  const haystack = (text || "").toLowerCase();
+  if (!haystack) return "";
+  const node = graph.nodes
+    .slice()
+    .sort((a, b) => (b.name || "").length - (a.name || "").length)
+    .find((item) => item.name && haystack.includes(item.name.toLowerCase()));
+  if (node) return node.id;
+  const edge = graph.edges.find((item) => haystack.includes(item.id.toLowerCase()));
+  return edge ? edge.id : "";
 }
 
 function normalizeResourceRequirements(requirements) {
@@ -3809,7 +5944,7 @@ function normalizeConstraintType(type) {
 function normalizeFlows(flows) {
   return (Array.isArray(flows) ? flows : [])
     .map((flow) => ({ raw: flow || {}, normalized: createFlow(flow || {}) }))
-    .filter(({ raw }) => raw.name || raw.kind || raw.quantity || raw.unit)
+    .filter(({ raw, normalized }) => raw.name || raw.kind || raw.quantity || raw.unit || normalized.value || normalized.cost)
     .map(({ normalized }) => normalized);
 }
 
@@ -3883,7 +6018,8 @@ function edgeVisual(edge) {
   }
   if (edge.type === "allocation") {
     color = "#168a55";
-    width = 2.8;
+    width = 2.6;
+    dash = "2 6"; // dotted line marks a resource being allocated into a task
     marker = "arrowGreen";
   }
   if (edge.type === "trigger") {
@@ -3959,69 +6095,21 @@ function inferTeamShape(node) {
   return "stream";
 }
 
-function migrateConstraintFields(payload) {
-  const expression = payload.expression || "";
-  const type = normalizeConstraintType(payload.type);
-  return { ...createConstraintFields(type, ""), value: expression };
-}
-
-function createConstraintFields(type, target = "") {
-  const template = CONSTRAINT_TEMPLATES[normalizeConstraintType(type)] || CONSTRAINT_TEMPLATES.flow_balance;
-  return {
-    target,
-    metric: template.metric,
-    operator: template.operator,
-    value: template.value,
-    unit: template.unit,
-    notes: template.notes,
-  };
-}
-
-function constraintExpression(constraint) {
-  const fields = constraint.fields || {};
-  const target = fields.target ? `${fields.target}: ` : "";
-  const metric = fields.metric || (constraint.type === "timing" ? "duration" : "flow");
-  const rule = operatorLabel(fields.operator || "equals");
-  const value = fields.value ? ` ${fields.value}` : "";
-  const unit = fields.unit ? ` ${fields.unit}` : "";
-  if (constraint.type === "flow_balance") return `${target}${metric} ${rule}${value}${unit}; account for transformation, storage, loss, or scrap.`;
-  if (constraint.type === "capability_limit") return `${target}${metric} ${rule}${value}${unit}.`;
-  if (constraint.type === "timing") return `${target}${metric} ${rule}${value}${unit}.`;
-  if (constraint.type === "routing_rule") return `${target}${metric} ${rule}${value}${unit}.`;
-  if (constraint.type === "policy_rule") return `${target}${metric} ${rule}${value}${unit}.`;
-  return `${target}${metric} ${rule}${value}${unit}`.trim();
-}
-
-function inferConstraintTarget(constraint) {
-  const haystack = `${constraint.expression || ""} ${constraint.fields?.value || ""} ${constraint.fields?.notes || ""}`.toLowerCase();
-  const nodeMatch = graph.nodes
-    .slice()
-    .sort((a, b) => b.name.length - a.name.length)
-    .find((node) => haystack.includes(node.name.toLowerCase()));
-  if (nodeMatch) return nodeMatch.name;
-  const resourceMatch = graph.resources
-    .slice()
-    .sort((a, b) => b.name.length - a.name.length)
-    .find((resource) => haystack.includes(resource.name.toLowerCase()));
-  if (resourceMatch) return resourceMatch.name;
-  return "";
-}
-
-function operatorLabel(operator) {
-  const labels = {
-    equals: "equals",
-    at_most: "at most",
-    at_least: "at least",
-    after: "after",
-    before: "before",
-    requires: "requires",
-    routes_to: "routes to",
-    allowed_when: "allowed when",
-    blocked_when: "blocked when",
-    lasts: "lasts",
-    custom: "custom rule",
-  };
-  return labels[operator] || titleCase(operator);
+// Migration-only: build a readable free-text statement from legacy structured
+// constraint fields so pre-text-model constraints don't render blank. Not used by
+// the editor — the textarea expression is the source of truth going forward.
+function legacyConstraintText(constraint) {
+  const fields = (constraint && constraint.fields) || {};
+  const parts = [
+    fields.target,
+    fields.metric,
+    fields.operator ? String(fields.operator).replace(/_/g, " ") : "",
+    fields.value,
+    fields.unit,
+  ]
+    .map((part) => String(part || "").trim())
+    .filter(Boolean);
+  return parts.join(" ").trim();
 }
 
 function ontologyLabel(group, id) {
@@ -4250,6 +6338,7 @@ function nodeColor(type) {
   if (type === "source") return "#168a55";
   if (type === "sink") return "#15181d";
   if (type === "decision") return "#d98021";
+  if (type === "resource") return "#0f9b9b";
   return "#2166d2";
 }
 

@@ -4,9 +4,13 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Leave unset to use the deterministic fallback compiler.
-      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - PROCESS_GRAPH_DEFAULT_TENANT=${PROCESS_GRAPH_DEFAULT_TENANT:-default}
+      - COSMOS_URI=${COSMOS_URI:-}
+      - COSMOS_KEY=${COSMOS_KEY:-}
+      - COSMOS_DATABASE=${COSMOS_DATABASE:-process_graph_builder}
+      - COSMOS_GRAPHS_CONTAINER=${COSMOS_GRAPHS_CONTAINER:-graphs}
+      - COSMOS_MUTATION_BATCHES_CONTAINER=${COSMOS_MUTATION_BATCHES_CONTAINER:-mutation_batches}
+      - COSMOS_CREATE_IF_MISSING=${COSMOS_CREATE_IF_MISSING:-true}
     volumes:
       # Persist graph data between container restarts during local development.
       - ./data:/app/data
