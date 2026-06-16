@@ -122,6 +122,18 @@ def test_markdown_export_includes_nodes_and_edges():
 # --- HTTP endpoints ---------------------------------------------------------
 
 
+def test_healthz_endpoint():
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+
+
+def test_static_frontend_served():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "Process Graph" in response.text
+
+
 def test_get_graph_creates_default():
     response = client.get("/graph/g-get")
     assert response.status_code == 200

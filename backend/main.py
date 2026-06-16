@@ -11,10 +11,13 @@ from typing import Any, Literal, Protocol
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 
 STORE_PATH = Path(os.environ.get("PROCESS_GRAPH_STORE", Path(__file__).parent / "data" / "graphs.json"))
+STATIC_DIR = Path(os.environ.get("PROCESS_GRAPH_STATIC_DIR", Path(__file__).resolve().parents[1]))
+VERSION = os.environ.get("APP_VERSION", "dev")
 
 
 def resolve_tenant_id(x_tenant_id: str | None = Header(default=None)) -> str:
@@ -458,7 +461,7 @@ def markdown_export(graph: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-app = FastAPI(title="Process Graph Builder API")
+app = FastAPI(title="Process Graph Builder API", version=VERSION)
 DEV_ORIGINS = os.environ.get(
     "PROCESS_GRAPH_CORS_ORIGINS",
     "http://localhost:4173,http://127.0.0.1:4173",
@@ -471,6 +474,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/healthz", include_in_schema=False)
+def healthz() -> dict[str, str]:
+    return {"status": "ok", "version": VERSION}
 
 
 # Routes are intentionally sync `def`, not `async def`. The active storage
@@ -511,3 +519,8 @@ def assist_graph(request: AssistRequest, tenant_id: str = Depends(resolve_tenant
 def export_markdown(graph_id: str, tenant_id: str = Depends(resolve_tenant_id)) -> str:
     graph = get_graph_or_create(store, tenant_id, graph_id)
     return markdown_export(graph)
+
+
+# Mounted last so API routes take precedence over the static frontend.
+if STATIC_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

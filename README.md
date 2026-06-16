@@ -37,6 +37,25 @@ http://localhost:4173/
 
 The app is dependency-free and can also be opened directly from `index.html`.
 
+To run the full app through FastAPI:
+
+```powershell
+pip install -r backend/requirements.txt
+uvicorn backend.main:app --reload --port 8000
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8000/
+```
+
+Docker Compose is also available:
+
+```powershell
+docker compose up --build
+```
+
 ### Frontend-only save and load (no backend)
 
 The app runs fully in the browser with no backend. State persists to `localStorage`
@@ -51,16 +70,8 @@ automatically, and you can move a graph between machines or share it as a file:
   rather than breaking the app.
 
 This uses a classic file download/upload, so it works even when `index.html` is
-opened directly from `file://`. The optional backend below is not required for any
-of this.
-
-Optional backend scaffold:
-
-```powershell
-cd process-graph-builder\backend
-pip install -r requirements.txt
-uvicorn main:app --reload
-```
+opened directly from `file://`. The backend is additive, not required for local
+file authoring.
 
 To have the browser app call the backend assist/mutate endpoints during local development:
 
@@ -75,9 +86,9 @@ The backend selects its storage layer from the environment:
 - **Local JSON file (default):** used when `COSMOS_URI` is unset. Graphs persist to the
   path in `PROCESS_GRAPH_STORE` (defaults to `backend/data/graphs.json`). Good for
   single-user dev; no Azure dependency needed at runtime.
-- **Azure Cosmos DB:** used when `COSMOS_URI` is set. Graphs are stored one document per
-  graph (container partitioned by `/id`) and mutation batches in a second container
-  (partitioned by `/graph_id`). Cosmos-managed fields (`_etag`, `_ts`, ...) are stripped
+- **Azure Cosmos DB:** used when `COSMOS_URI` is set. Graphs and mutation batches
+  are stored in separate containers, both partitioned by `/tenant_id`.
+  Cosmos-managed fields (`_etag`, `_ts`, ...) are stripped
   before graphs are returned, so the public contract stays clean `snake_case`.
 
 Cosmos environment variables:
@@ -107,11 +118,13 @@ python -m pytest backend/tests -q
 - `BACKLOG.md` - milestone backlog and test plan
 - `PROPEL_ALIGNMENT.md` - Propel product, architecture, artifact, and naming guardrails
 - `backend/main.py` - FastAPI scaffold for graph get/mutate/assist/Markdown export
+- `Dockerfile` / `docker-compose.yml` - containerized full-app runtime
+- `.github/workflows/build.yml` - GitHub Actions image build and ACR push workflow
 - `assets/process-graph-concept.png` - generated visual concept used for implementation direction
 
 ## MVP Notes
 
-The local compiler is a deterministic browser-side stub. A FastAPI-compatible scaffold now exists under `backend/` with `GET /graph/{id}`, `POST /graph/mutate`, `POST /graph/assist`, and `GET /graph/{id}/export/md`. The backend assist endpoint currently uses a deterministic fallback compiler so the wire shape is ready before an external LLM provider is configured.
+The local compiler is a deterministic browser-side stub. A FastAPI-compatible backend exists under `backend/` with `GET /graph/{id}`, `POST /graph/mutate`, `POST /graph/assist`, and `GET /graph/{id}/export/md`. The backend also serves the static frontend when run as the full app. The backend assist endpoint currently uses a deterministic fallback compiler so the wire shape is ready before an external LLM provider is configured.
 
 Ontology is stored inside the graph and can be inferred from current graph contents. Directed edges imply precedence, while edge flow payloads describe what moves. Constraint `expression` is kept for export compatibility, but the UI now edits structured fields and regenerates the expression.
 
