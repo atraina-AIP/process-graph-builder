@@ -10,11 +10,13 @@ backend test suite, and chat/log surfacing of backend errors. On the frontend, a
 **local-file mode** (Export/Import JSON, fully offline) was added and `snake_case` is now
 enforced on persisted and exported state.
 
+Progress (2026-07-07): cloud deployment save/load now has a same-origin backend path. The frontend hydrates from `GET /graph/{graph_id}/envelope`, saves full envelopes with `PUT /graph/{graph_id}/envelope`, uses `GET /graphs` for the cloud library when available, and keeps localStorage/file import/export as the offline fallback.
+
 Direction: the app now runs in **two coexisting modes** — (1) a default **local-file /
 offline mode** (browser-only, localStorage + JSON file import/export, no backend required),
 and (2) an optional **backend mode** for durable, multi-user, auditable persistence
-(Cosmos DB). These are complementary, not either/or; remaining priorities are the graph
-library, subgraph views, real LLM assist, and tenant-scoped durable records.
+(Cosmos DB). These are complementary, not either/or; remaining priorities are real LLM assist,
+concurrency hardening, backend export parity, and optional localStorage-to-cloud migration.
 
 Propel context: this project is the Process Mapper / Graph Builder wedge of Propel. It should produce durable, auditable artifacts that can feed knowledge graph, solver, explanation, approval, and memory services. Public contracts should use `snake_case`.
 
@@ -28,9 +30,9 @@ Review triage (2026-06-03):
   envelopes, JSON exports, design-space exports, and import fallbacks.
 - **Frontend polish now:** Import JSON should read `allow_cycles` with the existing legacy
   `allowCycles` fallback so exported settings round-trip cleanly.
-- **Backend later:** authenticate/bind `tenant_id` instead of trusting only `X-Tenant-Id`,
-  add optimistic concurrency or locking for mutation writes, validate mutation payloads before
-  persistence, and bring backend Markdown export into parity with the frontend export contract.
+- **Backend later:** add optimistic concurrency or locking for mutation/envelope writes,
+  validate mutation payloads before persistence, bring backend Markdown export into parity
+  with the frontend export contract, and keep richer authz work behind the frontend-first priorities.
 
 ## Milestone 0: UI Polish Baseline
 
@@ -103,8 +105,7 @@ Acceptance:
 - [x] User can duplicate or delete a saved graph (delete is confirm-guarded).
 - [x] Loading a graph does not destroy another saved graph — load never writes the library; entries are cloned on save/load.
 
-Follow-ups (not blocking): rename in place; sort/search when the list grows; and—once the
-backend opt-in exists—sync the library to Cosmos so it isn't browser-local.
+Follow-ups (not blocking): rename in place; sort/search when the list grows; and localStorage-to-cloud migration if users need it.
 
 ### P0-3 Subgraph Views
 
@@ -353,8 +354,7 @@ Acceptance:
 - [x] `GET /graph/{id}`, `POST /graph/mutate`, `POST /graph/assist`, and Markdown export are stable (covered by the backend test suite).
 - [x] API errors appear in the chat/log without losing local graph state — assist failures post a chat warning; sync failures post a mutation-log entry; both toast. Local state stays authoritative.
 - [x] Backend contracts use Pydantic v2 request models (`Mutation`, `MutateRequest`, `AssistRequest`), ready to move into a future `propel_schemas` package.
-- [ ] Low-priority hardening: bind `tenant_id` to authenticated identity before production
-  use; the current `X-Tenant-Id` header is tenant scoping, not authorization.
+- [x] Cloud tenant binding: derive `tenant_id` from Azure App Service Easy Auth claims when present; keep `X-Tenant-Id` and `PROCESS_GRAPH_DEFAULT_TENANT` as local/dev fallbacks.
 - [ ] Low-priority hardening: prevent lost updates on concurrent `POST /graph/mutate`
   calls (JSON-file locking and/or Cosmos ETag/optimistic concurrency).
 - [ ] Low-priority hardening: validate and normalize mutation payloads against the graph
@@ -372,21 +372,15 @@ threadpool); switch to `async def` only when the store offers async I/O (`azure.
 Persist graph envelopes durably. Target is **Azure Cosmos DB**, with a local JSON file
 store as the dev-compatible substitute (selected by the `COSMOS_URI` env var).
 
-Status: partially done (2026-06-01). A storage abstraction (`GraphStore`) ships with two
-backends — `JsonFileStore` (dev default) and `CosmosGraphStore` (graphs partitioned by
-`/id`, mutation batches by `/graph_id`; Cosmos system fields stripped at the adapter layer).
+Status: cloud save/load slice done (2026-07-07), 37 backend tests pass. A storage abstraction (`GraphStore`) ships with two backends - `JsonFileStore` (dev default) and `CosmosGraphStore` (tenant-partitioned Cosmos). The frontend now hydrates from the backend on load, saves the full frontend envelope on Save, and uses the backend graph library when available while keeping offline localStorage/file workflows intact.
 
 Acceptance:
-- [~] Reload restores graph state across server restarts — backend persists graphs and
-  mutation batches; the frontend does not yet rehydrate from the backend on load (local
-  mode is authoritative). Cross-session restore via the backend is pending the opt-in flow.
-- [~] Storage includes graph JSON, ontology, chat transcript, open questions, mutation log,
-  and graph versions (all inside the graph document). Layout, viewport, selected object,
-  pending plan, and saved subgraph views are frontend envelope concerns not yet sent to the
-  backend.
-- [ ] Production-ready records include `tenant_id` before real portfolio-company data is
-  used — **not yet** (Propel guardrail: no tenant-less production records). See P1-2a.
-- [ ] Saved graph migration from localStorage is tested — not yet.
+- [x] Reload restores graph state across server restarts when backend mode is available - the frontend hydrates `GET /graph/{graph_id}/envelope` on load.
+- [x] Storage includes the full frontend envelope - graph JSON, layout, viewport, selected object, chat/open questions, mutation log, filters, and saved views are saved through `PUT /graph/{graph_id}/envelope`.
+- [x] Graph library can list/load/save backend graphs through `GET /graphs` and the envelope endpoints; localStorage library remains the offline fallback.
+- [x] Production-ready records include `tenant_id`; Easy Auth tenant claims are preferred, with `X-Tenant-Id` and env defaults kept for local/dev use.
+- [ ] Saved graph migration from existing localStorage entries to backend library is tested - not yet.
+- [ ] Low-priority hardening: add optimistic concurrency/ETag handling for concurrent cloud saves.
 
 ### P1-2a Tenant Scoping
 
@@ -394,18 +388,14 @@ Add tenant context to durable records before any real portfolio-company data is 
 (Propel guardrail: no tenant-less production records). Promoted from a buried acceptance
 line in P0-0/P1-2 because it gates production use.
 
-Status: backend done (2026-06-02), 30 tests pass. Tenant resolved via `X-Tenant-Id` header
-→ `PROCESS_GRAPH_DEFAULT_TENANT` env → `"default"`; `GraphStore` is tenant-scoped
-(`JsonFileStore` namespaces by tenant, `CosmosGraphStore` partitions by `/tenant_id`); graphs
-+ mutation batches stamped with `tenant_id`; cross-tenant isolation proven over HTTP; schema v3
-adds optional `tenant_id`. **Remaining: frontend wiring** — send `X-Tenant-Id` and surface
-tenant in the saved envelope (deferred; pairs with the backend opt-in flow).
+Status: backend + frontend wiring done (2026-07-07), 37 tests pass. Tenant is resolved from Easy Auth (`X-MS-CLIENT-PRINCIPAL`) first, then `X-Tenant-Id`, then `PROCESS_GRAPH_DEFAULT_TENANT`, then `default`. The frontend can send `X-Tenant-Id` from `process-graph-builder-tenant-id` for local/dev backend mode. Richer authorization and group checks remain in P1-4a.
 
 Acceptance:
 - [x] Graph envelope and Cosmos documents carry `tenant_id`.
 - [x] Cosmos partition strategy is tenant-aware (partitioned by `/tenant_id`).
 - [x] Reads/writes are scoped to a tenant; cross-tenant access is not possible by default.
-- [ ] Frontend sends a tenant and shows it (pending backend opt-in flow).
+- [x] Frontend can send tenant context in backend mode, and cloud mode derives it from signed-in identity.
+- [ ] Surface tenant/session in the UI (low priority; not required for the current frontend workflow).
 
 ### P1-3 Version History
 
@@ -661,7 +651,7 @@ space and export it; we can import and visualize what the search returns.
 
 - Browser smoke tests for chat send, clarification loop, pending preview, apply/discard, undo, panel collapse, inspector edits, pan/zoom/minimap, notation profile switching, save/load (incl. JSON import/export round trip), and subgraph views.
 - Schema tests for graph JSON, mutation JSON, saved graph envelope, saved views, and LLM assist response shape.
-- [x] Backend tests for mutate/get/assist/export — done (`backend/tests/`, includes the storage-selection + JSON store tests). Cosmos backend needs a live account/emulator and is not yet covered.
+- [x] Backend tests for mutate/get/assist/export/session/envelope storage - done (`backend/tests/`, 37 tests passing). Cosmos backend needs a live account/emulator and is not yet covered.
 - Persistence tests for graph reload, graph version restore, and localStorage migration.
 - Export regression tests for Markdown and JSON round trip.
 

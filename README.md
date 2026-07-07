@@ -73,23 +73,29 @@ This uses a classic file download/upload, so it works even when `index.html` is
 opened directly from `file://`. The backend is additive, not required for local
 file authoring.
 
-To have the browser app call the backend assist/mutate endpoints during local development:
+When the frontend is served by FastAPI or the Docker container, it calls the same-origin backend automatically. If you host the static files separately during local development, point the browser at the API:
 
 ```js
 localStorage.setItem("process-graph-builder-api-base", "http://127.0.0.1:8000")
 ```
 
+### Cloud save and load
+
+For cloud deployment, serve the static frontend and FastAPI backend from the same origin. The app will:
+
+- hydrate the current graph from `GET /graph/{graph_id}/envelope` on load
+- save the full frontend envelope with `PUT /graph/{graph_id}/envelope`
+- populate the Library dialog from `GET /graphs`
+- derive `tenant_id` from Azure App Service Easy Auth headers, with `X-Tenant-Id` and `PROCESS_GRAPH_DEFAULT_TENANT` as local/dev fallbacks
+
+Enable App Service Authentication with a Microsoft identity provider when deploying behind Azure App Service. The frontend does not need a secret; the backend reads the signed-in user context from `X-MS-CLIENT-PRINCIPAL`.
+
 ### Backend storage
 
 The backend selects its storage layer from the environment:
 
-- **Local JSON file (default):** used when `COSMOS_URI` is unset. Graphs persist to the
-  path in `PROCESS_GRAPH_STORE` (defaults to `backend/data/graphs.json`). Good for
-  single-user dev; no Azure dependency needed at runtime.
-- **Azure Cosmos DB:** used when `COSMOS_URI` is set. Graphs and mutation batches
-  are stored in separate containers, both partitioned by `/tenant_id`.
-  Cosmos-managed fields (`_etag`, `_ts`, ...) are stripped
-  before graphs are returned, so the public contract stays clean `snake_case`.
+- **Local JSON file (default):** used when `COSMOS_URI` is unset. Graphs, saved frontend envelopes, and mutation batches persist to the path in `PROCESS_GRAPH_STORE` (defaults to `backend/data/graphs.json`). Good for single-user dev; no Azure dependency needed at runtime.
+- **Azure Cosmos DB:** used when `COSMOS_URI` is set. Graphs and mutation batches are stored in separate containers, both partitioned by `/tenant_id`. Full frontend state is stored privately on graph documents as `frontend_envelope`; Cosmos-managed fields and private envelope fields are stripped before graphs are returned, so the public contract stays clean `snake_case`.
 
 Cosmos environment variables:
 
@@ -124,7 +130,7 @@ python -m pytest backend/tests -q
 
 ## MVP Notes
 
-The local compiler is a deterministic browser-side stub. A FastAPI-compatible backend exists under `backend/` with `GET /graph/{id}`, `POST /graph/mutate`, `POST /graph/assist`, and `GET /graph/{id}/export/md`. The backend also serves the static frontend when run as the full app. The backend assist endpoint currently uses a deterministic fallback compiler so the wire shape is ready before an external LLM provider is configured.
+The local compiler is a deterministic browser-side stub. A FastAPI-compatible backend exists under `backend/` with `GET /graph/{id}`, `GET /graph/{id}/envelope`, `PUT /graph/{id}/envelope`, `GET /graphs`, `GET /session`, `POST /graph/mutate`, `POST /graph/assist`, and `GET /graph/{id}/export/md`. The backend also serves the static frontend when run as the full app. The backend assist endpoint currently uses a deterministic fallback compiler so the wire shape is ready before an external LLM provider is configured.
 
 Ontology is stored inside the graph and can be inferred from current graph contents. Directed edges imply precedence, while edge flow payloads describe what moves. Constraint `expression` is kept for export compatibility, but the UI now edits structured fields and regenerates the expression.
 
