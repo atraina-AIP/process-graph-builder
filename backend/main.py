@@ -4,6 +4,8 @@ import json
 import os
 import re
 import uuid
+import base64
+import binascii
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,19 +20,115 @@ from pydantic import BaseModel, Field
 STORE_PATH = Path(os.environ.get("PROCESS_GRAPH_STORE", Path(__file__).parent / "data" / "graphs.json"))
 STATIC_DIR = Path(os.environ.get("PROCESS_GRAPH_STATIC_DIR", Path(__file__).resolve().parents[1]))
 VERSION = os.environ.get("APP_VERSION", "dev")
+PRIVATE_GRAPH_DOCUMENT_FIELDS = {"frontend_envelope", "updated_at"}
 
 
-def resolve_tenant_id(x_tenant_id: str | None = Header(default=None)) -> str:
+class IdentityContext(BaseModel):
+    tenant_id: str
+    user_id: str = ""
+    user_name: str = ""
+    source: str = "default"
+
+
+def _header_value(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _slug_tenant(value: str) -> str:
+    value = value.strip()
+    return slug(value) if value else "default"
+
+
+def _claim_value(claims: list[dict[str, Any]], *claim_types: str) -> str:
+    normalized = {claim_type.lower() for claim_type in claim_types}
+    for claim in claims:
+        claim_type = str(claim.get("typ") or claim.get("type") or claim.get("name") or "").lower()
+        if claim_type in normalized:
+            return str(claim.get("val") or claim.get("value") or "")
+    return ""
+
+
+def parse_client_principal(value: Any) -> dict[str, Any] | None:
+    """Parse Azure App Service Easy Auth's X-MS-CLIENT-PRINCIPAL header."""
+    value = _header_value(value)
+    if not value:
+        return None
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        decoded = base64.b64decode(padded).decode("utf-8")
+        parsed = json.loads(decoded)
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def resolve_identity_context(
+    x_tenant_id: str | None = Header(default=None),
+    x_ms_client_principal: str | None = Header(default=None, alias="X-MS-CLIENT-PRINCIPAL"),
+    x_ms_client_principal_id: str | None = Header(default=None, alias="X-MS-CLIENT-PRINCIPAL-ID"),
+    x_ms_client_principal_name: str | None = Header(default=None, alias="X-MS-CLIENT-PRINCIPAL-NAME"),
+) -> IdentityContext:
+    """Resolve user/tenant context from auth headers, then explicit/dev fallbacks.
+
+    In cloud deployments with Azure App Service Authentication (Easy Auth), the
+    tenant is derived from the signed-in user's token claims. Local dev can still
+    pass X-Tenant-Id or use PROCESS_GRAPH_DEFAULT_TENANT.
+    """
+    tenant_header = _header_value(x_tenant_id)
+    principal_id = _header_value(x_ms_client_principal_id)
+    principal_name = _header_value(x_ms_client_principal_name)
+    principal = parse_client_principal(x_ms_client_principal)
+    if principal:
+        claims = principal.get("claims") if isinstance(principal.get("claims"), list) else []
+        tenant_claim = _claim_value(
+            claims,
+            "http://schemas.microsoft.com/identity/claims/tenantid",
+            "tid",
+            "tenant_id",
+        )
+        user_id = (
+            _claim_value(claims, "http://schemas.microsoft.com/identity/claims/objectidentifier", "oid", "sub")
+            or str(principal.get("userId") or principal_id or "")
+        )
+        user_name = str(principal.get("userDetails") or principal_name or "")
+        if tenant_claim:
+            return IdentityContext(
+                tenant_id=_slug_tenant(tenant_claim),
+                user_id=user_id,
+                user_name=user_name,
+                source="auth_claim",
+            )
+        if user_name and "@" in user_name:
+            return IdentityContext(
+                tenant_id=_slug_tenant(user_name.split("@", 1)[1]),
+                user_id=user_id,
+                user_name=user_name,
+                source="auth_user_domain",
+            )
+
+    if tenant_header:
+        return IdentityContext(tenant_id=tenant_header, source="x_tenant_id")
+    return IdentityContext(tenant_id=os.environ.get("PROCESS_GRAPH_DEFAULT_TENANT", "default"), source="default")
+
+
+def resolve_tenant_id(
+    x_tenant_id: str | None = Header(default=None),
+    x_ms_client_principal: str | None = Header(default=None, alias="X-MS-CLIENT-PRINCIPAL"),
+    x_ms_client_principal_id: str | None = Header(default=None, alias="X-MS-CLIENT-PRINCIPAL-ID"),
+    x_ms_client_principal_name: str | None = Header(default=None, alias="X-MS-CLIENT-PRINCIPAL-NAME"),
+) -> str:
     """Resolve the tenant for a request (Propel guardrail: no tenant-less records).
 
-    Order: the ``X-Tenant-Id`` request header, then the
-    ``PROCESS_GRAPH_DEFAULT_TENANT`` env var, then the literal ``"default"``.
-    Used as a FastAPI dependency on every durable route so a tenant id is always
-    threaded through to the store. The id stays ``snake_case`` on the wire.
+    Order: authenticated cloud identity headers, the ``X-Tenant-Id`` request
+    header, then the ``PROCESS_GRAPH_DEFAULT_TENANT`` env var, then the literal
+    ``"default"``. The id stays ``snake_case`` on the wire.
     """
-    if x_tenant_id and x_tenant_id.strip():
-        return x_tenant_id.strip()
-    return os.environ.get("PROCESS_GRAPH_DEFAULT_TENANT", "default")
+    return resolve_identity_context(
+        x_tenant_id=x_tenant_id,
+        x_ms_client_principal=x_ms_client_principal,
+        x_ms_client_principal_id=x_ms_client_principal_id,
+        x_ms_client_principal_name=x_ms_client_principal_name,
+    ).tenant_id
 
 MUTATION_ACTIONS = {
     "add_node",
@@ -88,6 +186,12 @@ class AssistRequest(BaseModel):
     user_message: str = ""
 
 
+class GraphEnvelopeRequest(BaseModel):
+    """Request envelope for saving the full frontend graph state."""
+
+    envelope: dict[str, Any] = Field(default_factory=dict)
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -129,7 +233,11 @@ def default_graph(graph_id: str = "pg-intake-to-close", tenant_id: str = "defaul
 def _strip_cosmos_system_fields(item: dict[str, Any]) -> dict[str, Any]:
     """Drop Cosmos-managed properties (``_rid``, ``_etag``, ``_ts``, ...) so the
     public graph contract stays clean snake_case with no SDK-native fields."""
-    return {key: value for key, value in item.items() if not key.startswith("_")}
+    return {
+        key: value
+        for key, value in item.items()
+        if not key.startswith("_") and key not in PRIVATE_GRAPH_DOCUMENT_FIELDS
+    }
 
 
 class GraphStore(Protocol):
@@ -146,10 +254,16 @@ class GraphStore(Protocol):
 
     def append_mutation_batch(self, tenant_id: str, batch: dict[str, Any]) -> None: ...
 
+    def list_graphs(self, tenant_id: str) -> list[dict[str, Any]]: ...
+
+    def get_envelope(self, tenant_id: str, graph_id: str) -> dict[str, Any] | None: ...
+
+    def upsert_envelope(self, tenant_id: str, graph_id: str, envelope: dict[str, Any]) -> None: ...
+
 
 class JsonFileStore:
     """Local dev store backed by a single JSON file. Reads/writes the whole file
-    per operation — fine for a single-user scaffold, not for production.
+    per operation - fine for a single-user scaffold, not for production.
 
     Layout is tenant-namespaced so cross-tenant access is impossible by default::
 
@@ -163,7 +277,7 @@ class JsonFileStore:
         }
 
     A read for a missing tenant (or a missing graph within a tenant) returns
-    ``None`` — so tenant B never sees tenant A's graph."""
+    ``None`` - so tenant B never sees tenant A's graph."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -180,15 +294,20 @@ class JsonFileStore:
             json.dump(store, handle, indent=2)
 
     def _tenant_bucket(self, store: dict[str, Any], tenant_id: str) -> dict[str, Any]:
-        return store.setdefault("tenants", {}).setdefault(
-            tenant_id, {"graphs": {}, "mutation_batches": []}
+        bucket = store.setdefault("tenants", {}).setdefault(
+            tenant_id, {"graphs": {}, "graph_envelopes": {}, "mutation_batches": []}
         )
+        bucket.setdefault("graphs", {})
+        bucket.setdefault("graph_envelopes", {})
+        bucket.setdefault("mutation_batches", [])
+        return bucket
 
     def get_graph(self, tenant_id: str, graph_id: str) -> dict[str, Any] | None:
         tenant = self._load().get("tenants", {}).get(tenant_id)
         if tenant is None:
             return None
-        return tenant.get("graphs", {}).get(graph_id)
+        graph = tenant.get("graphs", {}).get(graph_id)
+        return _strip_cosmos_system_fields(graph) if graph else None
 
     def upsert_graph(self, tenant_id: str, graph: dict[str, Any]) -> None:
         store = self._load()
@@ -202,16 +321,48 @@ class JsonFileStore:
         bucket["mutation_batches"].append({**batch, "tenant_id": tenant_id})
         self._save(store)
 
+    def list_graphs(self, tenant_id: str) -> list[dict[str, Any]]:
+        tenant = self._load().get("tenants", {}).get(tenant_id)
+        if tenant is None:
+            return []
+        envelopes = tenant.get("graph_envelopes", {})
+        summaries = []
+        for graph_id, graph in tenant.get("graphs", {}).items():
+            envelope = envelopes.get(graph_id, {})
+            updated_at = envelope.get("updated_at") or graph.get("updated_at") or graph.get("metadata", {}).get("created_at", "")
+            summaries.append(graph_summary(_strip_cosmos_system_fields(graph), updated_at=updated_at))
+        return sorted(summaries, key=lambda item: item.get("updated_at", ""), reverse=True)
+
+    def get_envelope(self, tenant_id: str, graph_id: str) -> dict[str, Any] | None:
+        tenant = self._load().get("tenants", {}).get(tenant_id)
+        if tenant is None:
+            return None
+        envelope = tenant.get("graph_envelopes", {}).get(graph_id)
+        if envelope:
+            return envelope
+        graph = tenant.get("graphs", {}).get(graph_id)
+        return {"graph": _strip_cosmos_system_fields(graph)} if graph else None
+
+    def upsert_envelope(self, tenant_id: str, graph_id: str, envelope: dict[str, Any]) -> None:
+        store = self._load()
+        bucket = self._tenant_bucket(store, tenant_id)
+        graph = envelope.get("graph") if isinstance(envelope.get("graph"), dict) else default_graph(graph_id, tenant_id)
+        graph = {**_strip_cosmos_system_fields(graph), "id": graph_id, "tenant_id": tenant_id, "updated_at": now()}
+        envelope = {**envelope, "graph": _strip_cosmos_system_fields(graph), "updated_at": graph["updated_at"]}
+        bucket["graphs"][graph_id] = graph
+        bucket["graph_envelopes"][graph_id] = envelope
+        self._save(store)
+
 
 class CosmosGraphStore:
     """Azure Cosmos DB store, tenant-partitioned. Both containers partition by
     ``/tenant_id`` so every read and write is physically scoped to a single
-    tenant — cross-tenant access is impossible by default (Propel guardrail).
+    tenant - cross-tenant access is impossible by default (Propel guardrail).
     The Cosmos SDK is imported lazily so local dev needs no Azure dependency.
 
     Partition strategy: ``/tenant_id`` is the partition key on both containers.
     A graph's logical identity within a tenant is ``id`` (the ``graph_id``), so
-    a graph is uniquely addressed by the composite (``tenant_id``, ``id``) — the
+    a graph is uniquely addressed by the composite (``tenant_id``, ``id``) - the
     same ``graph_id`` may exist independently under different tenants. Reads use
     ``read_item(item=graph_id, partition_key=tenant_id)``; a graph that lives in
     another tenant's partition is never returned. Mutation-batch queries always
@@ -263,11 +414,56 @@ class CosmosGraphStore:
         return _strip_cosmos_system_fields(item)
 
     def upsert_graph(self, tenant_id: str, graph: dict[str, Any]) -> None:
-        document = {**_strip_cosmos_system_fields(graph), "tenant_id": tenant_id}
+        from azure.cosmos import exceptions
+
+        document = {**_strip_cosmos_system_fields(graph), "tenant_id": tenant_id, "updated_at": now()}
+        existing = None
+        try:
+            existing = self._graphs.read_item(item=document["id"], partition_key=tenant_id)
+        except exceptions.CosmosResourceNotFoundError:
+            existing = None
+        if existing and existing.get("frontend_envelope"):
+            document["frontend_envelope"] = existing["frontend_envelope"]
         self._graphs.upsert_item(document)
 
     def append_mutation_batch(self, tenant_id: str, batch: dict[str, Any]) -> None:
         self._batches.upsert_item({**batch, "tenant_id": tenant_id, "id": uuid.uuid4().hex})
+
+    def list_graphs(self, tenant_id: str) -> list[dict[str, Any]]:
+        query = "SELECT c.id, c.name, c.version, c.tenant_id, c.updated_at, c.metadata, c.nodes, c.edges FROM c WHERE c.tenant_id = @tenant_id"
+        items = self._graphs.query_items(
+            query=query,
+            parameters=[{"name": "@tenant_id", "value": tenant_id}],
+            partition_key=tenant_id,
+        )
+        summaries = [graph_summary(_strip_cosmos_system_fields(item), updated_at=item.get("updated_at", "")) for item in items]
+        return sorted(summaries, key=lambda item: item.get("updated_at", ""), reverse=True)
+
+    def get_envelope(self, tenant_id: str, graph_id: str) -> dict[str, Any] | None:
+        from azure.cosmos import exceptions
+
+        try:
+            item = self._graphs.read_item(item=graph_id, partition_key=tenant_id)
+        except exceptions.CosmosResourceNotFoundError:
+            return None
+        if item.get("tenant_id") != tenant_id:
+            return None
+        envelope = item.get("frontend_envelope")
+        if isinstance(envelope, dict):
+            return envelope
+        return {"graph": _strip_cosmos_system_fields(item)}
+
+    def upsert_envelope(self, tenant_id: str, graph_id: str, envelope: dict[str, Any]) -> None:
+        graph = envelope.get("graph") if isinstance(envelope.get("graph"), dict) else default_graph(graph_id, tenant_id)
+        updated_at = now()
+        document = {
+            **_strip_cosmos_system_fields(graph),
+            "id": graph_id,
+            "tenant_id": tenant_id,
+            "updated_at": updated_at,
+            "frontend_envelope": {**envelope, "graph": _strip_cosmos_system_fields(graph), "updated_at": updated_at},
+        }
+        self._graphs.upsert_item(document)
 
 
 def select_store_kind() -> str:
@@ -283,6 +479,18 @@ def create_store() -> GraphStore:
 
 
 store: GraphStore = create_store()
+
+
+def graph_summary(graph: dict[str, Any], updated_at: str = "") -> dict[str, Any]:
+    return {
+        "id": graph.get("id", ""),
+        "name": graph.get("name") or graph.get("id", "Untitled Process Graph"),
+        "version": graph.get("version", ""),
+        "tenant_id": graph.get("tenant_id", ""),
+        "updated_at": updated_at or graph.get("updated_at") or graph.get("metadata", {}).get("created_at", ""),
+        "node_count": len(graph.get("nodes", []) or []),
+        "edge_count": len(graph.get("edges", []) or []),
+    }
 
 
 def get_graph_or_create(store: GraphStore, tenant_id: str, graph_id: str) -> dict[str, Any]:
@@ -479,6 +687,39 @@ app.add_middleware(
 @app.get("/healthz", include_in_schema=False)
 def healthz() -> dict[str, str]:
     return {"status": "ok", "version": VERSION}
+
+
+@app.get("/session")
+def session(identity: IdentityContext = Depends(resolve_identity_context)) -> dict[str, str]:
+    return identity.model_dump()
+
+
+@app.get("/graphs")
+def list_graphs(tenant_id: str = Depends(resolve_tenant_id)) -> dict[str, list[dict[str, Any]]]:
+    return {"graphs": store.list_graphs(tenant_id)}
+
+
+@app.get("/graph/{graph_id}/envelope")
+def get_graph_envelope(graph_id: str, tenant_id: str = Depends(resolve_tenant_id)) -> dict[str, Any]:
+    envelope = store.get_envelope(tenant_id, graph_id)
+    if envelope is None:
+        raise HTTPException(status_code=404, detail="Graph not found")
+    return envelope
+
+
+@app.put("/graph/{graph_id}/envelope")
+def save_graph_envelope(
+    graph_id: str,
+    request: GraphEnvelopeRequest,
+    tenant_id: str = Depends(resolve_tenant_id),
+) -> dict[str, Any]:
+    envelope = request.envelope or {}
+    graph = envelope.get("graph") if isinstance(envelope.get("graph"), dict) else None
+    if graph is None:
+        raise HTTPException(status_code=422, detail="Envelope must include graph")
+    graph["id"] = graph_id
+    store.upsert_envelope(tenant_id, graph_id, envelope)
+    return {"graph": store.get_graph(tenant_id, graph_id), "envelope": store.get_envelope(tenant_id, graph_id)}
 
 
 # Routes are intentionally sync `def`, not `async def`. The active storage

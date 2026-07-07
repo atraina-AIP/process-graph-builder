@@ -3,6 +3,7 @@
 const STORAGE_KEY = "process-graph-builder-state-v1";
 const LIBRARY_KEY = "process-graph-builder-library-v1";
 const API_BASE_STORAGE_KEY = "process-graph-builder-api-base";
+const TENANT_STORAGE_KEY = "process-graph-builder-tenant-id";
 const CURRENT_SAMPLE_GRAPH_ID = "pg-make-to-order";
 const LEGACY_SAMPLE_GRAPH_IDS = ["pg-intake-to-close"];
 const LEGACY_SAMPLE_GRAPH_NAMES = ["Intake to Close", "Supplier Invoice to Posted", "Invoice to Posted"];
@@ -520,6 +521,11 @@ let canvasView = { x: 0, y: 0, zoom: 1 };
 let activeFilter = createEmptyFilter();
 let currentFileHandle = null;
 let currentFileName = "";
+let backendAvailable = null;
+let backendSession = null;
+let cloudLibrary = { graphs: [] };
+let cloudLibraryLoaded = false;
+let cloudLibraryStatus = "local";
 // In-memory id of the saved view whose filter is currently applied (null when
 // the active filter is a custom/unsaved combination). Persisted as UI state in
 // the envelope (active_view_id) but never stored on the graph.
@@ -532,6 +538,7 @@ document.addEventListener("DOMContentLoaded", () => {
   loadState();
   bindEvents();
   render();
+  hydrateFromBackendOnLoad();
 });
 
 function bindElements() {
@@ -956,9 +963,12 @@ function formatTimestamp(iso) {
   return Number.isNaN(date.getTime()) ? "unknown" : date.toLocaleString();
 }
 
-function saveCurrentToLibrary(name) {
+async function saveCurrentToLibrary(name) {
   const cleanName = (name || "").trim() || graph.name || "Untitled Process Graph";
   graph.name = cleanName;
+
+  if (await saveCurrentToCloudLibrary(cleanName)) return;
+
   const library = loadLibrary();
   const envelope = clone(serializeState());
   const timestamp = new Date().toISOString();
@@ -983,10 +993,44 @@ function saveCurrentToLibrary(name) {
   saveState();
   renderLibrary();
   closeSaveDialog();
-  toast(existing ? `Updated "${cleanName}" in library` : `Saved "${cleanName}" to library`);
+  toast(existing ? `Updated "${cleanName}" in local library` : `Saved "${cleanName}" to local library`);
 }
 
-function loadFromLibrary(entryId) {
+async function saveCurrentToCloudLibrary(cleanName) {
+  if (!(await isBackendAvailable())) return false;
+  const base = apiBase();
+  const envelope = clone(serializeState());
+  envelope.graph = clone(graph);
+  try {
+    const response = await fetch(`${base}/graph/${encodeURIComponent(graph.id)}/envelope`, {
+      method: "PUT",
+      headers: backendJsonHeaders(),
+      body: JSON.stringify({ envelope }),
+    });
+    if (!response.ok) {
+      toast(`Cloud save failed (status ${response.status}); saved locally instead.`);
+      return false;
+    }
+    await refreshCloudLibrary({ silent: true });
+    saveState();
+    renderLibrary();
+    closeSaveDialog();
+    toast(`Saved "${cleanName}" to cloud library`);
+    return true;
+  } catch (error) {
+    console.warn("Unable to save to cloud library", error);
+    toast("Cloud save unavailable; saved locally instead.");
+    backendAvailable = false;
+    return false;
+  }
+}
+
+async function loadFromLibrary(entryId) {
+  if (cloudLibraryLoaded) {
+    await loadFromCloudLibrary(entryId);
+    return;
+  }
+
   const library = loadLibrary();
   const entry = library.graphs.find((item) => item.id === entryId);
   if (!entry || !entry.envelope) {
@@ -1004,7 +1048,40 @@ function loadFromLibrary(entryId) {
   toast(`Loaded "${entry.name}"`);
 }
 
+async function loadFromCloudLibrary(entryId) {
+  const base = apiBase();
+  try {
+    const response = await fetch(`${base}/graph/${encodeURIComponent(entryId)}/envelope`, {
+      headers: backendHeaders(),
+    });
+    if (!response.ok) {
+      toast(`Cloud graph load failed (status ${response.status})`);
+      return;
+    }
+    const envelope = await response.json();
+    if (!envelope?.graph) {
+      toast("Cloud graph did not include a graph envelope");
+      return;
+    }
+    applyEnvelopeToState(envelope);
+    clearCurrentFileHandle();
+    pendingPlan = null;
+    clarificationContext = null;
+    renderPlan();
+    render();
+    closeLibrary();
+    toast(`Loaded "${envelope.graph.name || entryId}" from cloud`);
+  } catch (error) {
+    console.warn("Unable to load cloud graph", error);
+    toast("Could not load cloud graph");
+  }
+}
+
 function duplicateLibraryEntry(entryId) {
+  if (cloudLibraryLoaded) {
+    toast("Duplicate is available for local library entries only");
+    return;
+  }
   const library = loadLibrary();
   const entry = library.graphs.find((item) => item.id === entryId);
   if (!entry) return;
@@ -1023,6 +1100,10 @@ function duplicateLibraryEntry(entryId) {
 }
 
 function deleteLibraryEntry(entryId) {
+  if (cloudLibraryLoaded) {
+    toast("Delete is not enabled for cloud library entries yet");
+    return;
+  }
   const library = loadLibrary();
   const entry = library.graphs.find((item) => item.id === entryId);
   if (!entry) return;
@@ -1033,12 +1114,22 @@ function deleteLibraryEntry(entryId) {
   toast(`Deleted "${entry.name}"`);
 }
 
+function activeLibrary() {
+  return cloudLibraryLoaded ? cloudLibrary : loadLibrary();
+}
+
 function renderLibrary() {
   if (!els.libraryList) return;
-  const library = loadLibrary();
+  if (cloudLibraryStatus === "loading") {
+    els.libraryList.innerHTML = `<div class="library-empty">Loading cloud library...</div>`;
+    return;
+  }
+  const isCloud = cloudLibraryLoaded;
+  const library = activeLibrary();
   const entries = [...library.graphs].sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
   if (!entries.length) {
-    els.libraryList.innerHTML = `<div class="library-empty">No saved graphs yet. Use Save to add the current graph to the library.</div>`;
+    const target = isCloud ? "cloud library" : "local library";
+    els.libraryList.innerHTML = `<div class="library-empty">No saved graphs yet. Use Save to add the current graph to the ${target}.</div>`;
     return;
   }
   els.libraryList.innerHTML = entries
@@ -1046,16 +1137,20 @@ function renderLibrary() {
       const nodeCount = entry.envelope?.graph?.nodes?.length ?? entry.node_count ?? 0;
       const edgeCount = entry.envelope?.graph?.edges?.length ?? entry.edge_count ?? 0;
       const updated = formatTimestamp(entry.updated_at || entry.saved_at);
+      const source = isCloud ? "Cloud" : "Local";
+      const localActions = isCloud
+        ? ""
+        : `<button class="button secondary" type="button" data-library-action="duplicate">Duplicate</button>
+           <button class="button secondary danger" type="button" data-library-action="delete">Delete</button>`;
       return `
         <div class="library-row" data-entry-id="${escapeAttribute(entry.id)}">
           <div class="library-row-main">
             <strong>${escapeHtml(entry.name)}</strong>
-            <span>${nodeCount} nodes · ${edgeCount} edges · ${escapeHtml(updated)}</span>
+            <span>${source} | ${nodeCount} nodes | ${edgeCount} edges | ${escapeHtml(updated)}</span>
           </div>
           <div class="library-row-actions">
             <button class="button secondary" type="button" data-library-action="load">Load</button>
-            <button class="button secondary" type="button" data-library-action="duplicate">Duplicate</button>
-            <button class="button secondary danger" type="button" data-library-action="delete">Delete</button>
+            ${localActions}
           </div>
         </div>
       `;
@@ -1063,12 +1158,40 @@ function renderLibrary() {
     .join("");
 }
 
-function openLibrary() {
+async function openLibrary() {
+  cloudLibraryStatus = "loading";
   renderLibrary();
   if (typeof els.libraryDialog.showModal === "function") {
     els.libraryDialog.showModal();
   } else {
     els.libraryDialog.setAttribute("open", "");
+  }
+  await refreshCloudLibrary();
+  renderLibrary();
+}
+
+async function refreshCloudLibrary(options = {}) {
+  const settings = { silent: false, ...options };
+  if (!(await isBackendAvailable())) {
+    cloudLibraryLoaded = false;
+    cloudLibraryStatus = "local";
+    return false;
+  }
+  cloudLibraryStatus = "loading";
+  try {
+    const response = await fetch(`${apiBase()}/graphs`, { headers: backendHeaders() });
+    if (!response.ok) throw new Error(`status ${response.status}`);
+    const body = await response.json();
+    cloudLibrary = { graphs: Array.isArray(body.graphs) ? body.graphs : [] };
+    cloudLibraryLoaded = true;
+    cloudLibraryStatus = "cloud";
+    return true;
+  } catch (error) {
+    console.warn("Unable to load cloud graph library", error);
+    cloudLibraryLoaded = false;
+    cloudLibraryStatus = "local";
+    if (!settings.silent) toast("Cloud library unavailable; showing local library");
+    return false;
   }
 }
 
@@ -1768,13 +1891,35 @@ async function planFromInstruction() {
   saveState();
 }
 
+async function hydrateFromBackendOnLoad() {
+  if (!(await isBackendAvailable())) return;
+  const graphId = graph?.id || CURRENT_SAMPLE_GRAPH_ID;
+  try {
+    const response = await fetch(`${apiBase()}/graph/${encodeURIComponent(graphId)}/envelope`, {
+      headers: backendHeaders(),
+    });
+    if (response.status === 404) return;
+    if (!response.ok) throw new Error(`status ${response.status}`);
+    const envelope = await response.json();
+    if (!envelope?.graph) return;
+    applyEnvelopeToState(envelope);
+    pendingPlan = null;
+    clarificationContext = null;
+    renderPlan();
+    render();
+  } catch (error) {
+    console.warn("Unable to hydrate graph from backend", error);
+  }
+}
+
 async function requestBackendAssist(message) {
+  if (clarificationContext?.plan?.questions?.length) return null;
+  if (!(await isBackendAvailable())) return null;
   const base = apiBase();
-  if (!base || clarificationContext?.plan?.questions?.length) return null;
   try {
     const response = await fetch(`${base}/graph/assist`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: backendJsonHeaders(),
       body: JSON.stringify({ graph_id: graph.id, user_message: message }),
     });
     if (!response.ok) {
@@ -1783,24 +1928,26 @@ async function requestBackendAssist(message) {
     }
     return await response.json();
   } catch {
+    backendAvailable = false;
     notifyBackendFailure("Could not reach the backend for assist. Using the local planner instead.");
     return null;
   }
 }
 
 async function syncBackendMutations(mutations) {
+  if (!mutations.length || !(await isBackendAvailable())) return;
   const base = apiBase();
-  if (!base || !mutations.length) return;
   try {
     const response = await fetch(`${base}/graph/mutate`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: backendJsonHeaders(),
       body: JSON.stringify({ graph_id: graph.id, mutations }),
     });
     if (!response.ok) {
       notifyBackendSyncFailure(`Backend sync failed (status ${response.status}). Your changes are saved locally.`);
     }
   } catch {
+    backendAvailable = false;
     notifyBackendSyncFailure("Could not reach the backend to sync. Your changes are saved locally.");
   }
 }
@@ -1835,8 +1982,52 @@ function notifyBackendSyncFailure(text) {
   saveState();
 }
 
-function apiBase() {
+function explicitApiBase() {
   return (localStorage.getItem(API_BASE_STORAGE_KEY) || window.PROCESS_GRAPH_API_BASE || "").replace(/\/+$/, "");
+}
+
+function apiBase() {
+  const explicit = explicitApiBase();
+  if (explicit) return explicit;
+  if (window.location.protocol === "http:" || window.location.protocol === "https:") {
+    return window.location.origin.replace(/\/+$/, "");
+  }
+  return "";
+}
+
+function backendHeaders() {
+  const headers = {};
+  const tenantId = (localStorage.getItem(TENANT_STORAGE_KEY) || "").trim();
+  if (tenantId) headers["X-Tenant-Id"] = tenantId;
+  return headers;
+}
+
+function backendJsonHeaders() {
+  return { "Content-Type": "application/json", ...backendHeaders() };
+}
+
+async function isBackendAvailable() {
+  if (backendAvailable !== null) return backendAvailable;
+  const base = apiBase();
+  if (!base) {
+    backendAvailable = false;
+    return false;
+  }
+  try {
+    const response = await fetch(`${base}/healthz`, { headers: backendHeaders(), cache: "no-store" });
+    backendAvailable = response.ok;
+    if (backendAvailable) {
+      try {
+        const sessionResponse = await fetch(`${base}/session`, { headers: backendHeaders(), cache: "no-store" });
+        backendSession = sessionResponse.ok ? await sessionResponse.json() : null;
+      } catch {
+        backendSession = null;
+      }
+    }
+  } catch {
+    backendAvailable = false;
+  }
+  return backendAvailable;
 }
 
 function compileWithClarification(message) {

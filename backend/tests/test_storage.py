@@ -42,6 +42,44 @@ def test_json_file_store_round_trip(tmp_path: Path):
     assert store.get_graph("default", "g1")["name"] == "Renamed"
 
 
+def test_json_file_store_envelope_round_trip_and_summary(tmp_path: Path):
+    store = JsonFileStore(tmp_path / "graphs.json")
+    graph = default_graph("g-env", "wrong_tenant")
+    graph["name"] = "Envelope Graph"
+    graph["nodes"] = [{"id": "n1", "name": "Shape", "type": "task"}]
+    envelope = {
+        "graph": graph,
+        "layout": {"nodes": {"n1": {"x": 10, "y": 20}}},
+        "mutation_log": [{"action": "add_node", "target_id": "n1"}],
+    }
+
+    store.upsert_envelope("tenant_a", "g-env", envelope)
+
+    loaded_graph = store.get_graph("tenant_a", "g-env")
+    assert loaded_graph["tenant_id"] == "tenant_a"
+    assert loaded_graph["name"] == "Envelope Graph"
+    assert "frontend_envelope" not in loaded_graph
+    assert "updated_at" not in loaded_graph
+
+    loaded_envelope = store.get_envelope("tenant_a", "g-env")
+    assert loaded_envelope["graph"]["tenant_id"] == "tenant_a"
+    assert loaded_envelope["layout"]["nodes"]["n1"] == {"x": 10, "y": 20}
+    assert loaded_envelope["updated_at"]
+
+    summaries = store.list_graphs("tenant_a")
+    assert summaries == [
+        {
+            "id": "g-env",
+            "name": "Envelope Graph",
+            "version": "0.1.0",
+            "tenant_id": "tenant_a",
+            "updated_at": loaded_envelope["updated_at"],
+            "node_count": 1,
+            "edge_count": 0,
+        }
+    ]
+    assert store.list_graphs("tenant_b") == []
+
 def test_json_file_store_stamps_tenant_id_on_upsert(tmp_path: Path):
     """The store stamps the partitioning tenant_id even if the graph dict lacks it."""
     store = JsonFileStore(tmp_path / "graphs.json")

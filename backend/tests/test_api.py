@@ -5,6 +5,9 @@ export, and the HTTP endpoints (including Pydantic request validation).
 """
 from __future__ import annotations
 
+import base64
+import json
+
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -20,6 +23,10 @@ from backend.main import (
 
 client = TestClient(app)
 
+
+def _easy_auth_header(principal):
+    payload = json.dumps(principal).encode("utf-8")
+    return base64.b64encode(payload).decode("ascii").rstrip("=")
 
 def _mutation(action, payload=None, target_id=None):
     return {
@@ -128,6 +135,36 @@ def test_healthz_endpoint():
     assert response.json()["status"] == "ok"
 
 
+def test_session_defaults_to_default_tenant():
+    response = client.get("/session")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tenant_id"] == "default"
+    assert body["source"] == "default"
+
+
+def test_session_resolves_easy_auth_tenant_claim():
+    principal = {
+        "userDetails": "maker@example.com",
+        "userId": "user-1",
+        "claims": [
+            {"typ": "http://schemas.microsoft.com/identity/claims/tenantid", "val": "Tenant 123"},
+        ],
+    }
+    response = client.get(
+        "/session",
+        headers={
+            "X-MS-CLIENT-PRINCIPAL": _easy_auth_header(principal),
+            "X-Tenant-Id": "dev_tenant",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tenant_id"] == "tenant_123"
+    assert body["user_id"] == "user-1"
+    assert body["user_name"] == "maker@example.com"
+    assert body["source"] == "auth_claim"
+
 def test_static_frontend_served():
     response = client.get("/")
     assert response.status_code == 200
@@ -143,6 +180,58 @@ def test_get_graph_creates_default():
     # Durable records are tenant-scoped; the default tenant is stamped.
     assert body["tenant_id"] == "default"
 
+
+def test_graph_envelope_save_list_and_load_round_trip():
+    graph = default_graph("g-envelope", "wrong_tenant")
+    graph["name"] = "Cloud Envelope"
+    graph["nodes"] = [{"id": "n1", "name": "Cut", "type": "task"}]
+    envelope = {
+        "graph": graph,
+        "layout": {"nodes": {"n1": {"x": 120, "y": 80}}},
+        "selected": {"type": "node", "id": "n1"},
+        "mutation_log": [{"action": "add_node", "target_id": "n1"}],
+        "open_questions": ["What is the cycle time?"],
+        "canvas_view": {"x": 1, "y": 2, "zoom": 0.9},
+    }
+
+    save_response = client.put(
+        "/graph/g-envelope/envelope",
+        headers={"X-Tenant-Id": "tenant_cloud"},
+        json={"envelope": envelope},
+    )
+    assert save_response.status_code == 200
+    save_body = save_response.json()
+    assert save_body["graph"]["id"] == "g-envelope"
+    assert save_body["graph"]["tenant_id"] == "tenant_cloud"
+    assert "frontend_envelope" not in save_body["graph"]
+    assert "updated_at" not in save_body["graph"]
+    assert save_body["envelope"]["layout"]["nodes"]["n1"] == {"x": 120, "y": 80}
+
+    list_response = client.get("/graphs", headers={"X-Tenant-Id": "tenant_cloud"})
+    assert list_response.status_code == 200
+    summary = list_response.json()["graphs"][0]
+    assert summary["id"] == "g-envelope"
+    assert summary["name"] == "Cloud Envelope"
+    assert summary["node_count"] == 1
+    assert summary["edge_count"] == 0
+    assert summary["updated_at"]
+
+    load_response = client.get("/graph/g-envelope/envelope", headers={"X-Tenant-Id": "tenant_cloud"})
+    assert load_response.status_code == 200
+    loaded = load_response.json()
+    assert loaded["graph"]["tenant_id"] == "tenant_cloud"
+    assert loaded["mutation_log"] == [{"action": "add_node", "target_id": "n1"}]
+
+    graph_response = client.get("/graph/g-envelope", headers={"X-Tenant-Id": "tenant_cloud"})
+    assert graph_response.status_code == 200
+    graph_body = graph_response.json()
+    assert "frontend_envelope" not in graph_body
+    assert "updated_at" not in graph_body
+
+
+def test_graph_envelope_requires_graph():
+    response = client.put("/graph/g-missing-envelope/envelope", json={"envelope": {"layout": {}}})
+    assert response.status_code == 422
 
 def test_mutate_endpoint_applies_and_returns_graph():
     payload = {

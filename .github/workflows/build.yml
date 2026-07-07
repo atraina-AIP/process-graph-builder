@@ -12,7 +12,24 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend test dependencies
+        run: pip install -r backend/requirements-dev.txt
+
+      - name: Run backend tests
+        run: python -m pytest backend/tests -q
+
   build:
+    needs: test
     runs-on: ubuntu-latest
 
     steps:
@@ -23,26 +40,47 @@ jobs:
           VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}
         run: docker build --build-arg APP_VERSION=$VERSION -t process-graph-api:${{ github.sha }} .
 
+  publish:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # Configure required reviewers for this Environment in GitHub so production
+    # image publishes wait for human approval before Propel can pick them up.
+    environment:
+      name: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Azure publish configuration
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ACR_NAME: ${{ vars.ACR_NAME }}
+        run: |
+          missing=0
+          for name in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID ACR_NAME; do
+            if [ -z "${!name}" ]; then
+              echo "Missing required production variable: $name"
+              missing=1
+            fi
+          done
+          exit $missing
+
       - name: Azure login
-        if: >-
-          github.event_name == 'push' &&
-          vars.AZURE_CLIENT_ID != '' &&
-          vars.AZURE_TENANT_ID != '' &&
-          vars.AZURE_SUBSCRIPTION_ID != '' &&
-          vars.ACR_NAME != ''
         uses: azure/login@v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Build image
+        env:
+          VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}
+        run: docker build --build-arg APP_VERSION=$VERSION -t process-graph-api:${{ github.sha }} .
+
       - name: Push to ACR
-        if: >-
-          github.event_name == 'push' &&
-          vars.AZURE_CLIENT_ID != '' &&
-          vars.AZURE_TENANT_ID != '' &&
-          vars.AZURE_SUBSCRIPTION_ID != '' &&
-          vars.ACR_NAME != ''
         env:
           IMAGE: ${{ vars.ACR_NAME }}.azurecr.io/process-graph-api
           VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}
