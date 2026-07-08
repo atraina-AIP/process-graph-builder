@@ -6,7 +6,7 @@ Decision-grade process structure builder MVP.
 
 - Canonical `ProcessGraph` state as the source of truth
 - Mutation commands for graph edits
-- Chat-style mutation compiler stub that returns strict JSON
+- Chat-style deterministic mutation compiler with optional server-side LLM assist behind a feature switch
 - SVG canvas with draggable nodes and edge selection
 - Explicit input/output ports on node edges, with multiple ports inferred from node inputs, outputs, and connected edges
 - Collapsed modeling style selector for none, business process, value stream, system flow, team topology, or custom guidance
@@ -108,6 +108,21 @@ Cosmos environment variables:
 | `COSMOS_MUTATION_BATCHES_CONTAINER` | no | `mutation_batches` | Audit log of applied batches |
 | `COSMOS_CREATE_IF_MISSING` | no | `true` | Create database/containers on startup; set `false` if the app identity lacks control-plane rights |
 
+### Optional LLM assist
+
+LLM assist is off by default. To expose it, run the FastAPI backend with:
+
+```powershell
+$env:PROCESS_GRAPH_LLM_ASSIST_ENABLED = "true"
+$env:OPENAI_API_KEY = "..."
+# Optional; defaults to gpt-5.5
+$env:PROCESS_GRAPH_LLM_MODEL = "gpt-5.5"
+```
+
+Then turn on **LLM assist** in the left chat panel. The browser still previews returned mutations before anything is applied. If the server flag is off, the key/package is missing, or the provider call fails, `/graph/assist` returns the deterministic compiler result with a warning. The request includes the current graph snapshot and recent chat messages so the model does not plan against stale persisted state.
+
+The server prompt includes domain examples for DTA/data-to-action, network/distribution, manufacturing, and plant/structured-MILP authoring. The plant example generalizes from the plant schema/pipeline/NOR reference material around transferable optimization structure: node roles, stable IDs, node-property names, `variableType`, units, `timeConfig`, relationship constraints, and objective hints as graph metadata for future exporters without embedding contracts into plant topology.
+
 Run the backend tests with:
 
 ```powershell
@@ -130,7 +145,7 @@ python -m pytest backend/tests -q
 
 ## MVP Notes
 
-The local compiler is a deterministic browser-side stub. A FastAPI-compatible backend exists under `backend/` with `GET /graph/{id}`, `GET /graph/{id}/envelope`, `PUT /graph/{id}/envelope`, `GET /graphs`, `GET /session`, `POST /graph/mutate`, `POST /graph/assist`, and `GET /graph/{id}/export/md`. The backend also serves the static frontend when run as the full app. The backend assist endpoint currently uses a deterministic fallback compiler so the wire shape is ready before an external LLM provider is configured.
+The local compiler remains the offline deterministic fallback. A FastAPI-compatible backend exists under `backend/` with `GET /graph/{id}`, `GET /graph/{id}/envelope`, `PUT /graph/{id}/envelope`, `GET /graphs`, `GET /session`, `POST /graph/mutate`, `POST /graph/assist`, and `GET /graph/{id}/export/md`. The backend also serves the static frontend when run as the full app. The backend assist endpoint can use a server-side OpenAI-backed compiler only when `PROCESS_GRAPH_LLM_ASSIST_ENABLED=true` and the request sets `use_llm: true`; otherwise it returns the deterministic fallback compiler.
 
 Ontology is stored inside the graph and can be inferred from current graph contents. Directed edges imply precedence, while edge flow payloads describe what moves. Constraint `expression` is kept for export compatibility, but the UI now edits structured fields and regenerates the expression.
 

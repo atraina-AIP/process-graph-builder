@@ -20,7 +20,9 @@ Returns the resolved backend identity context used by the frontend to confirm ba
   "tenant_id": "default",
   "user_id": "",
   "user_name": "",
-  "source": "default"
+  "source": "default",
+  "llm_assist_available": false,
+  "llm_model": ""
 }
 ```
 
@@ -124,14 +126,19 @@ Edges carry typed flows instead of relying on diagram-only labels:
 
 ## POST /graph/assist
 
-Compiles a user message into mutation commands.
+Compiles a user message into mutation commands. By default this uses the deterministic compiler. If the backend is started with `PROCESS_GRAPH_LLM_ASSIST_ENABLED=true` and the request sets `use_llm: true`, the endpoint attempts the server-side LLM compiler and falls back deterministically with a warning if unavailable.
 
 ```json
 {
   "graph_id": "pg-intake-to-close",
-  "user_message": "Add source Customer request then Validate request then sink Closed"
+  "user_message": "Add source Customer request then Validate request then sink Closed",
+  "graph": { "id": "pg-intake-to-close", "nodes": [], "edges": [] },
+  "chat_messages": [],
+  "use_llm": false
 }
 ```
+
+`graph` and `chat_messages` are optional for backward compatibility, but the frontend sends them so assist planning uses the current in-browser graph rather than stale persisted state.
 
 Response shape:
 
@@ -141,6 +148,11 @@ Response shape:
   "mutations": [],
   "questions": [],
   "warnings": [],
+  "compiler": {
+    "mode": "deterministic",
+    "prompt_version": "process_graph_compiler_v2",
+    "llm_requested": false
+  },
   "handoff_readiness": {
     "structure_complete": true,
     "missing_values": [],

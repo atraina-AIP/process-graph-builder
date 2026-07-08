@@ -4,6 +4,7 @@ const STORAGE_KEY = "process-graph-builder-state-v1";
 const LIBRARY_KEY = "process-graph-builder-library-v1";
 const API_BASE_STORAGE_KEY = "process-graph-builder-api-base";
 const TENANT_STORAGE_KEY = "process-graph-builder-tenant-id";
+const LLM_ASSIST_STORAGE_KEY = "process-graph-builder-llm-assist-enabled";
 const CURRENT_SAMPLE_GRAPH_ID = "pg-make-to-order";
 const LEGACY_SAMPLE_GRAPH_IDS = ["pg-intake-to-close"];
 const LEGACY_SAMPLE_GRAPH_NAMES = ["Intake to Close", "Supplier Invoice to Posted", "Invoice to Posted"];
@@ -424,7 +425,13 @@ Allowed mutations:
 - add_constraint
 - update_constraint
 - add_assumption
-- add_question`;
+- add_question
+
+Few-shot examples used by the server-side LLM prompt:
+- DTA / data-to-action: telemetry or transaction data -> analytics/model scoring -> human review -> approved action system; preserve data, information, approval, and work flows separately.
+- Network / distribution: supplier, DC, store/customer, and returns nodes; represent physical movement as parts/material flows and return loops as feedback.
+- Manufacturing: order/MRP -> material preparation -> machine/process -> quality decision -> assembly/rework -> ship; represent pass/fail conditions, resources, material/data flows, and routing constraints.
+- Plant / structured MILP: preserve reusable optimization structure: node roles, stable IDs, node.property names, variableType hints, units, timeConfig, material-flow metadata, relationship constraints, and objective hints as graph metadata/constraints for future exporters; stage names are examples only, and contracts do not belong in plant topology.`;
 
 const sampleGraph = {
   id: CURRENT_SAMPLE_GRAPH_ID,
@@ -523,6 +530,7 @@ let currentFileHandle = null;
 let currentFileName = "";
 let backendAvailable = null;
 let backendSession = null;
+let llmAssistEnabled = false;
 let cloudLibrary = { graphs: [] };
 let cloudLibraryLoaded = false;
 let cloudLibraryStatus = "local";
@@ -595,6 +603,8 @@ function bindElements() {
     "applyPlanButton",
     "discardPlanButton",
     "undoButton",
+    "llmAssistToggle",
+    "llmAssistStatus",
     "chatScroll",
     "planPreview",
     "planStatus",
@@ -673,6 +683,15 @@ function bindEvents() {
       planFromInstruction();
     }
   });
+
+  if (els.llmAssistToggle) {
+    els.llmAssistToggle.addEventListener("change", () => {
+      llmAssistEnabled = Boolean(els.llmAssistToggle.checked);
+      localStorage.setItem(LLM_ASSIST_STORAGE_KEY, String(llmAssistEnabled));
+      renderLlmAssistToggle();
+      saveState();
+    });
+  }
 
   els.applyPlanButton.addEventListener("click", () => {
     if (!pendingPlan) return;
@@ -861,6 +880,8 @@ function applyEnvelopeToState(env) {
   const savedAllowCycles = readEnvelopeField(env, "allow_cycles", "allowCycles", undefined);
   allowCycles = savedAllowCycles !== undefined ? Boolean(savedAllowCycles) : true;
   validateCurrentView = Boolean(readEnvelopeField(env, "validate_current_view", "validateCurrentView", false));
+  const savedLlmAssist = readEnvelopeField(env, "llm_assist_enabled", "llmAssistEnabled", undefined);
+  llmAssistEnabled = savedLlmAssist !== undefined ? Boolean(savedLlmAssist) : localStorage.getItem(LLM_ASSIST_STORAGE_KEY) === "true";
   addNodeFormOpen = Boolean(readEnvelopeField(env, "add_node_form_open", "addNodeFormOpen", false));
   leftPanelCollapsed = Boolean(readEnvelopeField(env, "left_panel_collapsed", "leftPanelCollapsed", false));
   legendCollapsed = Boolean(readEnvelopeField(env, "legend_collapsed", "legendCollapsed", false));
@@ -878,6 +899,7 @@ function applyEnvelopeToState(env) {
 }
 
 function loadState() {
+  llmAssistEnabled = localStorage.getItem(LLM_ASSIST_STORAGE_KEY) === "true";
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
     if (!saved || !saved.graph) return;
@@ -921,6 +943,7 @@ function serializeState() {
     open_questions: openQuestions,
     allow_cycles: allowCycles,
     validate_current_view: validateCurrentView,
+    llm_assist_enabled: llmAssistEnabled,
     add_node_form_open: addNodeFormOpen,
     left_panel_collapsed: leftPanelCollapsed,
     legend_collapsed: legendCollapsed,
@@ -1856,6 +1879,7 @@ function render() {
   normalizeLayout();
   renderPanelCollapse();
   renderModelingStyle();
+  renderLlmAssistToggle();
   renderChatMessages();
   renderCanvas();
   renderNotationLegend();
@@ -1876,6 +1900,27 @@ function renderPlan() {
   els.discardPlanButton.disabled = !pendingPlan;
   els.planStatus.textContent = pendingPlan ? `${pendingPlan.mutations.length} mutations pending` : "No pending plan";
   els.planPreview.textContent = JSON.stringify(pendingPlan || {}, null, 2);
+}
+
+function renderLlmAssistToggle() {
+  if (!els.llmAssistToggle) return;
+  els.llmAssistToggle.checked = Boolean(llmAssistEnabled);
+  if (!els.llmAssistStatus) return;
+  if (!llmAssistEnabled) {
+    els.llmAssistStatus.textContent = "Off: deterministic compiler";
+    return;
+  }
+  if (backendAvailable === false) {
+    els.llmAssistStatus.textContent = "On locally; backend unavailable";
+    return;
+  }
+  if (backendSession?.llm_assist_available === false) {
+    els.llmAssistStatus.textContent = "On locally; server flag off";
+    return;
+  }
+  els.llmAssistStatus.textContent = backendSession?.llm_model
+    ? `On: ${backendSession.llm_model}`
+    : "On: ask backend LLM";
 }
 
 async function planFromInstruction() {
@@ -1920,7 +1965,13 @@ async function requestBackendAssist(message) {
     const response = await fetch(`${base}/graph/assist`, {
       method: "POST",
       headers: backendJsonHeaders(),
-      body: JSON.stringify({ graph_id: graph.id, user_message: message }),
+      body: JSON.stringify({
+        graph_id: graph.id,
+        user_message: message,
+        graph: clone(graph),
+        chat_messages: chatMessages.slice(-12),
+        use_llm: llmAssistEnabled,
+      }),
     });
     if (!response.ok) {
       notifyBackendFailure(`Backend assist failed (status ${response.status}). Using the local planner instead.`);
@@ -2020,6 +2071,7 @@ async function isBackendAvailable() {
       try {
         const sessionResponse = await fetch(`${base}/session`, { headers: backendHeaders(), cache: "no-store" });
         backendSession = sessionResponse.ok ? await sessionResponse.json() : null;
+        renderLlmAssistToggle();
       } catch {
         backendSession = null;
       }
@@ -5042,6 +5094,7 @@ function exportEnvelope() {
     mutation_log: mutationLog,
     open_questions: openQuestions,
     chat_messages: chatMessages,
+    llm_assist_enabled: llmAssistEnabled,
     ontology: graph.ontology,
     assumptions: graph.assumptions,
     versions: graph.versions || [],

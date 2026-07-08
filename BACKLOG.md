@@ -450,7 +450,7 @@ offline / unauthenticated fallback.
 
 ### P1-4 LLM Mutation Compiler
 
-Replace the browser stub with the backend assist endpoint, backed by OpenAI.
+Replace the browser stub with the backend assist endpoint, backed by OpenAI. Initial implementation is feature-flagged and still requires production auth/model-router hardening.
 
 Acceptance:
 - Assist endpoint returns strict JSON with `summary`, `mutations`, `questions`, `warnings`, and `handoff_readiness`.
@@ -667,7 +667,6 @@ the deterministic core unit-testable.
   JSON file store as the dev substitute (was "JSON graph persistence" / Postgres).
 - The app supports two coexisting modes — local-file/offline (default) and optional backend
   — rather than backend-by-default.
-- Current browser compiler (deterministic stub) remains until a real LLM is wired behind
-  `POST /graph/assist`; the backend `assist` endpoint is also a stub today, not an LLM.
+- Current browser compiler remains the offline/default fallback. `POST /graph/assist` now has a feature-flagged server-side LLM path (`PROCESS_GRAPH_LLM_ASSIST_ENABLED=true` + request `use_llm: true`) with deterministic fallback on disablement or provider failure. Prompt examples now include DTA/data-to-action, network/distribution, manufacturing, and plant/structured-MILP authoring patterns generalized around transferable structure and relationship constraints rather than fixed NOR stage vocabulary.
 - Save/load started local (file Export/Import) and extends to backend persistence without
   changing the graph envelope.

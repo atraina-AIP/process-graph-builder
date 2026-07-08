@@ -21,6 +21,10 @@ STORE_PATH = Path(os.environ.get("PROCESS_GRAPH_STORE", Path(__file__).parent / 
 STATIC_DIR = Path(os.environ.get("PROCESS_GRAPH_STATIC_DIR", Path(__file__).resolve().parents[1]))
 VERSION = os.environ.get("APP_VERSION", "dev")
 PRIVATE_GRAPH_DOCUMENT_FIELDS = {"frontend_envelope", "updated_at"}
+LLM_ASSIST_TRUE_VALUES = {"1", "true", "yes", "on"}
+COMPILER_PROMPT_VERSION = "process_graph_compiler_v2"
+DEFAULT_LLM_MODEL = "gpt-5.5"
+LLM_ASSIST_CLIENT: Any = None
 
 
 class IdentityContext(BaseModel):
@@ -184,6 +188,9 @@ class AssistRequest(BaseModel):
 
     graph_id: str
     user_message: str = ""
+    graph: dict[str, Any] | None = None
+    chat_messages: list[dict[str, Any]] = Field(default_factory=list)
+    use_llm: bool = False
 
 
 class GraphEnvelopeRequest(BaseModel):
@@ -199,6 +206,21 @@ def now() -> str:
 def slug(value: str) -> str:
     clean = re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
     return clean[:58] or "id"
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in LLM_ASSIST_TRUE_VALUES
+
+
+def is_llm_assist_enabled() -> bool:
+    return env_flag("PROCESS_GRAPH_LLM_ASSIST_ENABLED", False)
+
+
+def llm_model_name() -> str:
+    return os.environ.get("PROCESS_GRAPH_LLM_MODEL", DEFAULT_LLM_MODEL).strip() or DEFAULT_LLM_MODEL
 
 
 def default_graph(graph_id: str = "pg-intake-to-close", tenant_id: str = "default") -> dict[str, Any]:
@@ -549,8 +571,14 @@ def apply_mutation(graph: dict[str, Any], mutation: dict[str, Any]) -> None:
 
 def compile_assist_message(graph: dict[str, Any], user_message: str) -> dict[str, Any]:
     text = user_message.strip()
+    compiler = {"mode": "deterministic", "prompt_version": COMPILER_PROMPT_VERSION}
     if not text:
-        return compiler_response("No instruction provided", [], ["What process structure should be added or modified?"])
+        return compiler_response(
+            "No instruction provided",
+            [],
+            ["What process structure should be added or modified?"],
+            compiler=compiler,
+        )
 
     parts = [part.strip(" .;") for part in re.split(r"\s*(?:->|=>|,|\bthen\b|\bnext\b|\bto\b)\s*", text, flags=re.I)]
     parts = [part for part in parts if part]
@@ -564,7 +592,7 @@ def compile_assist_message(graph: dict[str, Any], user_message: str) -> dict[str
             "reason": "User described a step without clear sequencing",
             "confidence": "medium",
         }
-        return compiler_response("Instruction needs sequencing clarification", [mutation], [question])
+        return compiler_response("Instruction needs sequencing clarification", [mutation], [question], compiler=compiler)
 
     mutations: list[dict[str, Any]] = []
     node_ids: list[str] = []
@@ -583,7 +611,9 @@ def compile_assist_message(graph: dict[str, Any], user_message: str) -> dict[str
                 }
             )
 
-    for from_id, to_id in zip(node_ids, node_ids[1:]):
+    for index, (from_id, to_id) in enumerate(zip(node_ids, node_ids[1:])):
+        from_name = parts[index]
+        to_name = parts[index + 1]
         mutations.append(
             {
                 "action": "add_edge",
@@ -594,14 +624,44 @@ def compile_assist_message(graph: dict[str, Any], user_message: str) -> dict[str
                     "to_node": to_id,
                     "type": "flow",
                     "condition": "",
-                    "flows": [],
+                    "flows": infer_flows_from_text(text, from_name, to_name),
                 },
                 "reason": "User described flow between steps",
                 "confidence": "high",
             }
         )
 
-    return compiler_response("Compiled user instruction into graph mutations", mutations, [])
+    return compiler_response("Compiled user instruction into graph mutations", mutations, [], compiler=compiler)
+
+
+def infer_flows_from_text(text: str, from_name: str = "", to_name: str = "") -> list[dict[str, Any]]:
+    haystack = f"{text} {from_name} {to_name}"
+    candidates = [
+        (r"\b(cash|money|payment|invoice|revenue|cost|budget|price|dollar|margin)\b", "cash", "cash"),
+        (r"\b(energy|electric|electricity|power|heat|fuel|steam|compressed air)\b", "energy", "energy"),
+        (r"\b(part|parts|material|component|inventory|product|goods|scrap|unit|pallet|pallets|shipment|shipments)\b", "parts", "parts"),
+        (r"\b(data|record|file|measurement|table|model input|model output|telemetry|sensor)\b", "data", "data"),
+        (r"\b(approval|approve|sign off|permission|authorization|release)\b", "approval", "approval"),
+        (r"\b(request|order|message|document|information|notice|signal|instruction|forecast)\b", "information", "information"),
+        (r"\b(work|job|case|task|effort|wip|ticket)\b", "work", "work"),
+    ]
+    flows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    edge_prefix = slug(f"{from_name}_{to_name}")
+    for pattern, name, kind in candidates:
+        if re.search(pattern, haystack, flags=re.I) and name not in seen:
+            seen.add(name)
+            flows.append(
+                {
+                    "id": f"f_{edge_prefix}_{slug(name)}",
+                    "name": name,
+                    "kind": kind,
+                    "quantity": "",
+                    "unit": "",
+                    "properties": {},
+                }
+            )
+    return flows
 
 
 def make_node(name: str, full_text: str) -> dict[str, Any]:
@@ -640,12 +700,18 @@ def suggest_node_description(name: str, node_type: str) -> str:
     return f"{label} is a process step that turns incoming work or flow into outgoing work or flow."
 
 
-def compiler_response(summary: str, mutations: list[dict[str, Any]], questions: list[str]) -> dict[str, Any]:
-    return {
+def compiler_response(
+    summary: str,
+    mutations: list[dict[str, Any]],
+    questions: list[str],
+    warnings: list[str] | None = None,
+    compiler: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
         "summary": summary,
         "mutations": mutations,
         "questions": questions,
-        "warnings": [],
+        "warnings": warnings or [],
         "handoff_readiness": {
             "structure_complete": not questions,
             "missing_values": [],
@@ -653,6 +719,283 @@ def compiler_response(summary: str, mutations: list[dict[str, Any]], questions: 
             "open_questions": questions,
         },
     }
+    if compiler:
+        result["compiler"] = compiler
+    return result
+
+
+ASSIST_RESPONSE_SCHEMA = {
+    "type": "object",
+    "required": ["summary", "mutations", "questions", "warnings", "handoff_readiness"],
+    "additionalProperties": False,
+    "properties": {
+        "summary": {"type": "string"},
+        "mutations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["action", "target_id", "payload", "reason", "confidence"],
+                "additionalProperties": False,
+                "properties": {
+                    "action": {"enum": sorted(MUTATION_ACTIONS)},
+                    "target_id": {"type": ["string", "null"]},
+                    "payload": {"type": "object"},
+                    "reason": {"type": "string"},
+                    "confidence": {"enum": ["high", "medium", "low"]},
+                },
+            },
+        },
+        "questions": {"type": "array", "items": {"type": "string"}},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "handoff_readiness": {
+            "type": "object",
+            "additionalProperties": True,
+            "properties": {
+                "structure_complete": {"type": "boolean"},
+                "missing_values": {"type": "array", "items": {"type": "string"}},
+                "missing_constraints": {"type": "array", "items": {"type": "string"}},
+                "open_questions": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+}
+
+
+PROCESS_GRAPH_COMPILER_BASE_PROMPT = """You are a process-graph mutation planner.
+
+Your job is to convert a user's process-mapping instruction into graph mutation commands.
+Return strict JSON only with summary, mutations, questions, warnings, and handoff_readiness.
+
+Rules:
+1. Use only allowed mutation actions, node types, edge types, flow kinds, and constraint types.
+2. Preserve existing IDs unless a mutation intentionally modifies or deletes an existing element.
+3. Never invent numeric quantities, costs, durations, capacities, rates, probabilities, or dates.
+4. If information is implied but uncertain, add an assumption or ask a clarification question.
+5. Directed edges imply precedence; do not create separate precedence constraints.
+6. Create typed edge flows for what moves: parts, cash, energy, information, data, work, approval, or custom.
+7. Branching compiles into decision nodes, conditioned outgoing edges, and routing_rule constraints when useful.
+8. Conservation, scrap, waste, loss, storage, and transformation compile into flow_balance constraints when useful.
+9. Resource needs and capacity limits compile into resource nodes, allocation edges, or capability_limit constraints.
+10. Treat your output as a proposal for human approval, not an operational fact.
+11. When the user mentions plant JSON, structured MILP, optimizer, NOR, scenarios, commodities, or process equipment, keep returning process-graph mutations but preserve exporter hints in node.attributes, edge.properties, flow.properties, assumptions, and constraints.
+12. For optimizer/MILP-oriented graphs, prioritize the transferable abstraction: stable node IDs, node roles (source/supply, transformation, storage/buffer, decision/quality, product/sink), named properties with units and variableType hints, typed flows, relationship constraints, objective terms, and timeConfig. Stage labels like Mixer/Dryer/Pellet Press are examples only; never force them when the user's domain has better vocabulary.
+13. Do not embed contracts as plant topology. Contracts and scenarios layer on later; ask a question when the selected contracts, scenario periods, or periodLength are unclear.
+14. Every constraint or objective hint that references node.property must refer to a property named on that node; otherwise ask a question instead of creating a dangling reference.
+"""
+
+
+PROCESS_GRAPH_COMPILER_EXAMPLES = [
+    {
+        "domain": "dta_flow",
+        "user_message": "Map the DTA flow: equipment telemetry lands in the historian, the analytics model scores anomalies, maintenance reviews high-risk alerts, and approved work orders go to CMMS.",
+        "assistant_response": {
+            "summary": "Compiled a data-to-action flow with data, information, approval, and work movement.",
+            "mutations": [
+                {"action": "add_node", "target_id": None, "payload": {"id": "n_equipment_telemetry", "name": "Equipment telemetry", "type": "source", "inputs": [], "outputs": ["telemetry"], "attributes": {}}, "reason": "Telemetry is the data source.", "confidence": "high"},
+                {"action": "add_node", "target_id": None, "payload": {"id": "n_score_anomalies", "name": "Score anomalies", "type": "task", "inputs": ["telemetry"], "outputs": ["risk score"], "attributes": {}}, "reason": "Analytics transforms telemetry into risk scores.", "confidence": "high"},
+                {"action": "add_node", "target_id": None, "payload": {"id": "n_review_alert", "name": "Review high-risk alert", "type": "decision", "inputs": ["risk score"], "outputs": ["approved work", "rejected alert"], "attributes": {}}, "reason": "Human review decides whether action is required.", "confidence": "medium"},
+                {"action": "add_edge", "target_id": None, "payload": {"id": "e_telemetry_score", "from_node": "n_equipment_telemetry", "to_node": "n_score_anomalies", "type": "flow", "condition": "", "flows": [{"id": "f_telemetry", "name": "telemetry", "kind": "data", "quantity": "", "unit": "", "properties": {}}]}, "reason": "Telemetry data feeds anomaly scoring.", "confidence": "high"},
+            ],
+            "questions": ["What happens to rejected alerts after maintenance review?"],
+            "warnings": [],
+            "handoff_readiness": {"structure_complete": False, "missing_values": [], "missing_constraints": [], "open_questions": ["What happens to rejected alerts after maintenance review?"]},
+        },
+    },
+    {
+        "domain": "network_distribution_flow",
+        "user_message": "Supplier ships pallets to the regional DC, the DC cross-docks priority orders to stores and stores return damaged goods to the returns center.",
+        "assistant_response": {
+            "summary": "Compiled a distribution network with material movements and a returns feedback path.",
+            "mutations": [
+                {"action": "add_node", "target_id": None, "payload": {"id": "n_supplier", "name": "Supplier", "type": "source", "inputs": [], "outputs": ["pallets"], "attributes": {}}, "reason": "Supplier is the upstream material source.", "confidence": "high"},
+                {"action": "add_node", "target_id": None, "payload": {"id": "n_regional_dc", "name": "Regional DC", "type": "task", "inputs": ["pallets"], "outputs": ["priority orders"], "attributes": {}}, "reason": "The DC receives and cross-docks goods.", "confidence": "high"},
+                {"action": "add_edge", "target_id": None, "payload": {"id": "e_supplier_dc", "from_node": "n_supplier", "to_node": "n_regional_dc", "type": "flow", "condition": "", "flows": [{"id": "f_pallets", "name": "pallets", "kind": "parts", "quantity": "", "unit": "", "properties": {}}]}, "reason": "Physical goods move into the DC.", "confidence": "high"},
+            ],
+            "questions": ["Should non-priority orders also leave the regional DC through a separate branch?"],
+            "warnings": [],
+            "handoff_readiness": {"structure_complete": False, "missing_values": [], "missing_constraints": [], "open_questions": ["Should non-priority orders also leave the regional DC through a separate branch?"]},
+        },
+    },
+
+    {
+        "domain": "plant_structured_milp",
+        "user_message": "Build a structured MILP-ready graph: hardwood chips and pine chips are purchased, blended into feed, moisture is reduced, finished product is produced and sold monthly using a 730 hour period length.",
+        "assistant_response": {
+            "summary": "Compiled an optimization-ready process graph with reusable node roles, material flows, property/variable hints, relationship constraints, objective guidance, and timeConfig assumptions for a future structured-MILP exporter.",
+            "mutations": [
+                {"action": "add_node", "target_id": None, "payload": {"id": "n_hardwood_chips", "name": "Hardwood chips supply", "type": "source", "inputs": [], "outputs": ["hardwood chips"], "attributes": {"optimizer_role": "source_supply", "milp_properties": {"Purchases_sTPerHr": {"variableType": "decision", "unit": "sT/hr"}, "UnitCost": {"variableType": "exogenous", "unit": "USD/sT"}, "Capacity": {"variableType": "processParameter", "unit": "sT/hr"}}}}, "reason": "Supply nodes should expose purchasable quantity, cost, and capacity properties for optimization export.", "confidence": "high"},
+                {"action": "add_node", "target_id": None, "payload": {"id": "n_blend_feed", "name": "Blend feed", "type": "task", "inputs": ["hardwood chips", "pine chips"], "outputs": ["blended feed"], "attributes": {"optimizer_role": "transformation", "milp_properties": {"Throughput_sTPerHr": {"variableType": "decision", "unit": "sT/hr"}, "RatedCapacity_sTPerHr": {"variableType": "processParameter", "unit": "sT/hr"}, "Yield": {"variableType": "processParameter", "unit": "percent"}}}}, "reason": "Transformation nodes should name throughput, capacity, and yield properties without relying on a fixed stage vocabulary.", "confidence": "high"},
+                {"action": "add_node", "target_id": None, "payload": {"id": "n_finished_product", "name": "Finished product", "type": "sink", "inputs": ["finished product"], "outputs": [], "attributes": {"optimizer_role": "product_sink", "milp_properties": {"Sales_sTPerHr": {"variableType": "decision", "unit": "sT/hr"}, "SellingPrice": {"variableType": "exogenous", "unit": "USD/sT"}}}}, "reason": "Product/sink nodes should expose sales and price properties for objective generation.", "confidence": "high"},
+                {"action": "add_edge", "target_id": None, "payload": {"id": "e_hardwood_chips_blend_feed", "from_node": "n_hardwood_chips", "to_node": "n_blend_feed", "type": "flow", "condition": "", "properties": {"export_flow_type": "material"}, "flows": [{"id": "f_hardwood_chips", "name": "hardwood chips", "kind": "parts", "quantity": "", "unit": "sT/hr", "properties": {"material": "hardwood chips", "flowType": "material"}}]}, "reason": "Edges preserve topology and material-flow metadata for future JSON export.", "confidence": "high"},
+                {"action": "add_constraint", "target_id": None, "payload": {"id": "c_blend_feed_balance", "type": "flow_balance", "fields": {"target": "n_blend_feed"}, "expression": "For each period, Blend feed output Throughput_sTPerHr should equal the sum of named input purchase or consumption rates adjusted by Yield when present; all node.property references must exist before export."}, "reason": "Relationship constraints over node.property references are the portable MILP abstraction.", "confidence": "medium"},
+                {"action": "add_constraint", "target_id": None, "payload": {"id": "c_blend_feed_capacity", "type": "capability_limit", "fields": {"target": "n_blend_feed"}, "expression": "For each period, Blend feed Throughput_sTPerHr must be less than or equal to RatedCapacity_sTPerHr, optionally adjusted by uptime and utilization if those properties are added."}, "reason": "Capacity constraints transfer across many process domains.", "confidence": "medium"},
+                {"action": "add_constraint", "target_id": None, "payload": {"id": "c_profit_objective_hint", "type": "policy_rule", "fields": {"target": "n_finished_product"}, "expression": "Structured MILP objective should maximize finished product Sales_sTPerHr revenue minus supply Purchases_sTPerHr costs; only reference node.property names that exist in the graph."}, "reason": "Objective guidance should be expressed as valid node.property terms for the exporter.", "confidence": "medium"},
+                {"action": "add_assumption", "target_id": None, "payload": {"id": "a_time_config", "text": "User specified monthly periods using a 730 hour periodLength; carry this as timeConfig guidance for rate-to-quantity conversion in structured-MILP export."}, "reason": "timeConfig.periodLength is load-bearing for rate-to-quantity conversion.", "confidence": "high"}
+            ],
+            "questions": ["How many periods should the scenario expose, and are contracts selected later outside the graph?"],
+            "warnings": [],
+            "handoff_readiness": {"structure_complete": False, "missing_values": ["scenario periods", "selected contracts"], "missing_constraints": [], "open_questions": ["How many periods should the scenario expose, and are contracts selected later outside the graph?"]}
+        }
+    },
+    {
+        "domain": "manufacturing_flow",
+        "user_message": "Customer order triggers MRP, material is cut on CNC, quality checks pass parts to assembly or fail parts to rework, then finished units ship.",
+        "assistant_response": {
+            "summary": "Compiled a make-to-order manufacturing flow with material, data, decision, and rework paths.",
+            "mutations": [
+                {"action": "add_node", "target_id": None, "payload": {"id": "n_customer_order", "name": "Customer order", "type": "source", "inputs": [], "outputs": ["order"], "attributes": {}}, "reason": "The order starts the manufacturing flow.", "confidence": "high"},
+                {"action": "add_node", "target_id": None, "payload": {"id": "n_quality_check", "name": "Quality check", "type": "decision", "inputs": ["cut parts"], "outputs": ["passed parts", "failed parts"], "attributes": {}}, "reason": "Quality check routes pass/fail branches.", "confidence": "high"},
+                {"action": "add_edge", "target_id": None, "payload": {"id": "e_qc_rework", "from_node": "n_quality_check", "to_node": "n_rework", "type": "flow", "condition": "if fail", "flows": [{"id": "f_failed_parts", "name": "failed parts", "kind": "parts", "quantity": "", "unit": "", "properties": {}}]}, "reason": "Failed parts move to rework.", "confidence": "high"},
+                {"action": "add_constraint", "target_id": None, "payload": {"id": "c_qc_routing", "type": "routing_rule", "fields": {"target": "n_quality_check"}, "expression": "Quality check routes passed parts to assembly and failed parts to rework."}, "reason": "Pass/fail routing should be explicit for handoff.", "confidence": "medium"},
+            ],
+            "questions": [],
+            "warnings": [],
+            "handoff_readiness": {"structure_complete": True, "missing_values": [], "missing_constraints": [], "open_questions": []},
+        },
+    },
+]
+
+
+def build_compiler_prompt() -> str:
+    return (
+        PROCESS_GRAPH_COMPILER_BASE_PROMPT
+        + "\nAllowed mutation actions: "
+        + ", ".join(sorted(MUTATION_ACTIONS))
+        + "\nAllowed node types: source, sink, task, decision, resource"
+        + "\nAllowed edge types: flow, dependency, trigger, feedback, allocation, custom"
+        + "\nAllowed flow kinds: parts, cash, energy, information, data, work, approval, custom"
+        + "\nAllowed constraint types: flow_balance, capability_limit, timing, routing_rule, policy_rule"
+        + "\n\nFew-shot examples:\n"
+        + json.dumps(PROCESS_GRAPH_COMPILER_EXAMPLES, indent=2)
+    )
+
+
+def graph_context_for_prompt(graph: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": graph.get("id"),
+        "name": graph.get("name"),
+        "modeling_style": graph.get("modeling_style"),
+        "nodes": graph.get("nodes", []),
+        "edges": graph.get("edges", []),
+        "constraints": graph.get("constraints", []),
+        "assumptions": graph.get("assumptions", []),
+        "open_questions": graph.get("open_questions", []),
+        "ontology": graph.get("ontology", {}),
+    }
+
+
+def build_llm_user_payload(graph: dict[str, Any], user_message: str, chat_messages: list[dict[str, Any]]) -> str:
+    payload = {
+        "user_message": user_message,
+        "current_graph": graph_context_for_prompt(graph),
+        "recent_chat_messages": chat_messages[-12:],
+        "response_contract": ASSIST_RESPONSE_SCHEMA,
+    }
+    return json.dumps(payload, indent=2)
+
+
+def extract_response_text(response: Any) -> str:
+    output_text = getattr(response, "output_text", "")
+    if output_text:
+        return str(output_text)
+    if isinstance(response, dict):
+        if response.get("output_text"):
+            return str(response["output_text"])
+        outputs = response.get("output") or []
+    else:
+        outputs = getattr(response, "output", []) or []
+    chunks: list[str] = []
+    for item in outputs:
+        content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", []) or []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text") or part.get("content")
+            else:
+                text = getattr(part, "text", None) or getattr(part, "content", None)
+            if text:
+                chunks.append(str(text))
+    return "".join(chunks)
+
+
+def normalize_llm_assist_response(raw: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("LLM assist response must be a JSON object")
+    normalized_mutations: list[dict[str, Any]] = []
+    for item in raw.get("mutations") or []:
+        candidate = {"target_id": None, "payload": {}, "reason": "", "confidence": "medium", **(item or {})}
+        normalized_mutations.append(Mutation(**candidate).model_dump())
+    questions = [str(question) for question in (raw.get("questions") or []) if str(question).strip()]
+    warnings = [str(warning) for warning in (raw.get("warnings") or []) if str(warning).strip()]
+    result = compiler_response(
+        str(raw.get("summary") or "Compiled user instruction into graph mutations"),
+        normalized_mutations,
+        questions,
+        warnings=warnings,
+        compiler={
+            "mode": "llm",
+            "prompt_version": COMPILER_PROMPT_VERSION,
+            "model": llm_model_name(),
+        },
+    )
+    if isinstance(raw.get("handoff_readiness"), dict):
+        result["handoff_readiness"] = {**result["handoff_readiness"], **raw["handoff_readiness"]}
+    return result
+
+
+def call_openai_assist(graph: dict[str, Any], user_message: str, chat_messages: list[dict[str, Any]]) -> dict[str, Any]:
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("Install the optional openai package to enable LLM assist") from exc
+
+    client = OpenAI()
+    response = client.responses.create(
+        model=llm_model_name(),
+        instructions=build_compiler_prompt(),
+        input=[{"role": "user", "content": build_llm_user_payload(graph, user_message, chat_messages)}],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "process_graph_assist_response",
+                "description": "Graph mutation plan returned by the process graph compiler.",
+                "schema": ASSIST_RESPONSE_SCHEMA,
+                "strict": False,
+            }
+        },
+    )
+    output_text = extract_response_text(response)
+    if not output_text:
+        raise ValueError("LLM assist returned no text")
+    return normalize_llm_assist_response(json.loads(output_text))
+
+
+def compile_assist_message_with_llm(
+    graph: dict[str, Any],
+    user_message: str,
+    chat_messages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if LLM_ASSIST_CLIENT is not None:
+        return normalize_llm_assist_response(LLM_ASSIST_CLIENT(graph, user_message, chat_messages))
+    return call_openai_assist(graph, user_message, chat_messages)
+
+
+def deterministic_fallback_response(
+    graph: dict[str, Any],
+    user_message: str,
+    warning: str | None = None,
+    llm_requested: bool = False,
+) -> dict[str, Any]:
+    response = compile_assist_message(graph, user_message)
+    response["compiler"] = {
+        "mode": "deterministic",
+        "prompt_version": COMPILER_PROMPT_VERSION,
+        "llm_requested": llm_requested,
+    }
+    if warning:
+        response.setdefault("warnings", []).append(warning)
+    return response
 
 
 def markdown_export(graph: dict[str, Any]) -> str:
@@ -690,8 +1033,11 @@ def healthz() -> dict[str, str]:
 
 
 @app.get("/session")
-def session(identity: IdentityContext = Depends(resolve_identity_context)) -> dict[str, str]:
-    return identity.model_dump()
+def session(identity: IdentityContext = Depends(resolve_identity_context)) -> dict[str, Any]:
+    data = identity.model_dump()
+    data["llm_assist_available"] = is_llm_assist_enabled()
+    data["llm_model"] = llm_model_name() if is_llm_assist_enabled() else ""
+    return data
 
 
 @app.get("/graphs")
@@ -752,8 +1098,25 @@ def mutate_graph(request: MutateRequest, tenant_id: str = Depends(resolve_tenant
 
 @app.post("/graph/assist")
 def assist_graph(request: AssistRequest, tenant_id: str = Depends(resolve_tenant_id)) -> dict[str, Any]:
-    graph = get_graph_or_create(store, tenant_id, request.graph_id)
-    return compile_assist_message(graph, request.user_message)
+    graph = deepcopy(request.graph) if isinstance(request.graph, dict) else get_graph_or_create(store, tenant_id, request.graph_id)
+    if request.use_llm:
+        if not is_llm_assist_enabled():
+            return deterministic_fallback_response(
+                graph,
+                request.user_message,
+                "LLM assist is disabled on the server; used deterministic fallback.",
+                llm_requested=True,
+            )
+        try:
+            return compile_assist_message_with_llm(graph, request.user_message, request.chat_messages)
+        except Exception as exc:
+            return deterministic_fallback_response(
+                graph,
+                request.user_message,
+                f"LLM assist failed ({type(exc).__name__}); used deterministic fallback.",
+                llm_requested=True,
+            )
+    return deterministic_fallback_response(graph, request.user_message)
 
 
 @app.get("/graph/{graph_id}/export/md")

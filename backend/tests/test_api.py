@@ -12,9 +12,11 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+import backend.main as main_module
 from backend.main import (
     apply_mutation,
     app,
+    build_compiler_prompt,
     compile_assist_message,
     default_graph,
     markdown_export,
@@ -101,6 +103,25 @@ def test_compile_multistep_instruction():
     actions = [mutation["action"] for mutation in response["mutations"]]
     assert "add_node" in actions
     assert "add_edge" in actions
+
+
+def test_compile_infers_distribution_flow_payload():
+    graph = default_graph()
+    response = compile_assist_message(graph, "Supplier ships pallets then Regional DC")
+    edges = [mutation["payload"] for mutation in response["mutations"] if mutation["action"] == "add_edge"]
+    assert edges
+    assert edges[0]["flows"][0]["kind"] == "parts"
+
+
+def test_compiler_prompt_includes_plant_structured_milp_guidance():
+    prompt = build_compiler_prompt()
+    assert "plant_structured_milp" in prompt
+    assert "timeConfig" in prompt
+    assert "variableType" in prompt
+    assert "node roles" in prompt
+    assert "Stage labels" in prompt
+    assert "Relationship constraints over node.property references" in prompt
+    assert "Contracts and scenarios layer on later" in prompt
 
 
 def test_compile_empty_message_returns_question():
@@ -263,6 +284,72 @@ def test_assist_endpoint_round_trip():
     body = response.json()
     assert "mutations" in body
     assert "handoff_readiness" in body
+
+
+def test_assist_uses_request_graph_context():
+    graph = default_graph("g-request-context")
+    graph["nodes"].append({"id": "n_start", "name": "Start", "type": "source", "inputs": [], "outputs": ["order"]})
+    payload = {
+        "graph_id": "g-request-context",
+        "user_message": "Start then Pack order",
+        "graph": graph,
+    }
+    response = client.post("/graph/assist", json=payload)
+    assert response.status_code == 200
+    add_node_ids = [
+        mutation["payload"].get("id")
+        for mutation in response.json()["mutations"]
+        if mutation["action"] == "add_node"
+    ]
+    assert "n_start" not in add_node_ids
+
+
+def test_assist_llm_requested_with_server_flag_off_falls_back(monkeypatch):
+    monkeypatch.delenv("PROCESS_GRAPH_LLM_ASSIST_ENABLED", raising=False)
+    payload = {"graph_id": "g-llm-off", "user_message": "Start then End", "use_llm": True}
+    response = client.post("/graph/assist", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["compiler"]["mode"] == "deterministic"
+    assert body["compiler"]["llm_requested"] is True
+    assert body["warnings"]
+
+
+def test_assist_llm_path_uses_mock_client(monkeypatch):
+    def fake_llm(graph, user_message, chat_messages):
+        assert graph["id"] == "g-llm-on"
+        assert user_message == "Use the model"
+        assert chat_messages == [{"role": "user", "detail": "prior"}]
+        return {
+            "summary": "LLM compiled plan",
+            "mutations": [
+                _mutation("add_node", {"id": "n_model", "name": "Model node", "type": "task"}),
+            ],
+            "questions": [],
+            "warnings": [],
+            "handoff_readiness": {
+                "structure_complete": True,
+                "missing_values": [],
+                "missing_constraints": [],
+                "open_questions": [],
+            },
+        }
+
+    monkeypatch.setenv("PROCESS_GRAPH_LLM_ASSIST_ENABLED", "true")
+    monkeypatch.setattr(main_module, "LLM_ASSIST_CLIENT", fake_llm)
+    payload = {
+        "graph_id": "g-llm-on",
+        "user_message": "Use the model",
+        "graph": default_graph("g-llm-on"),
+        "chat_messages": [{"role": "user", "detail": "prior"}],
+        "use_llm": True,
+    }
+    response = client.post("/graph/assist", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"] == "LLM compiled plan"
+    assert body["compiler"]["mode"] == "llm"
+    assert body["mutations"][0]["payload"]["id"] == "n_model"
 
 
 def test_export_md_endpoint():
