@@ -16,6 +16,13 @@ if str(ROOT) not in sys.path:
 TEST_DATA_DIR = ROOT / ".test-data"
 TEST_DATA_DIR.mkdir(exist_ok=True)
 os.environ["PROCESS_GRAPH_STORE"] = str(TEST_DATA_DIR / "graphs-test.json")
+for key in (
+    "PROCESS_GRAPH_STORE_KIND",
+    "COSMOS_URI",
+    "AZURE_SQL_CONNECTION_STRING",
+    "SQL_CONNECTION_STRING",
+):
+    os.environ.pop(key, None)
 
 import pytest  # noqa: E402
 

@@ -31,6 +31,15 @@ def _mutation(action, payload=None, target_id=None):
     }
 
 
+# --- health -----------------------------------------------------------------
+
+
+def test_healthz_includes_storage_kind():
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json()["storage"] == "json"
+
+
 # --- apply_mutation ---------------------------------------------------------
 
 

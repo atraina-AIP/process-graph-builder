@@ -8,7 +8,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from main import JsonFileStore, create_store, default_graph, select_store_kind
+import pytest
+
+from main import (
+    JsonFileStore,
+    _sql_table_reference,
+    create_store,
+    default_graph,
+    get_sql_connection_string,
+    select_store_kind,
+)
 
 
 def test_select_store_kind_defaults_to_json(monkeypatch):
@@ -21,9 +30,57 @@ def test_select_store_kind_cosmos_when_uri_set(monkeypatch):
     assert select_store_kind() == "cosmos"
 
 
+def test_select_store_kind_azure_sql_when_connection_string_set(monkeypatch):
+    monkeypatch.delenv("PROCESS_GRAPH_STORE_KIND", raising=False)
+    monkeypatch.delenv("COSMOS_URI", raising=False)
+    monkeypatch.setenv("AZURE_SQL_CONNECTION_STRING", "Driver={ODBC Driver 18 for SQL Server};")
+    assert select_store_kind() == "azure_sql"
+
+
+def test_select_store_kind_explicit_value_wins(monkeypatch):
+    monkeypatch.setenv("PROCESS_GRAPH_STORE_KIND", "azure-sql")
+    monkeypatch.setenv("COSMOS_URI", "https://example.documents.azure.com:443/")
+    assert select_store_kind() == "azure_sql"
+
+
+def test_select_store_kind_rejects_unknown_explicit_value(monkeypatch):
+    monkeypatch.setenv("PROCESS_GRAPH_STORE_KIND", "bogus")
+    with pytest.raises(ValueError):
+        select_store_kind()
+
+
+def test_get_sql_connection_string_supports_fallback_env_name(monkeypatch):
+    monkeypatch.delenv("AZURE_SQL_CONNECTION_STRING", raising=False)
+    monkeypatch.setenv("SQL_CONNECTION_STRING", "Driver={ODBC Driver 18 for SQL Server};")
+    assert get_sql_connection_string().startswith("Driver=")
+
+
 def test_create_store_returns_json_store_by_default(monkeypatch):
     monkeypatch.delenv("COSMOS_URI", raising=False)
+    monkeypatch.delenv("AZURE_SQL_CONNECTION_STRING", raising=False)
+    monkeypatch.delenv("SQL_CONNECTION_STRING", raising=False)
     assert isinstance(create_store(), JsonFileStore)
+
+
+def test_create_store_returns_sql_store_when_requested(monkeypatch):
+    class FakeSqlStore:
+        pass
+
+    monkeypatch.setenv("PROCESS_GRAPH_STORE_KIND", "azure_sql")
+    monkeypatch.setenv("AZURE_SQL_CONNECTION_STRING", "Driver={ODBC Driver 18 for SQL Server};")
+    monkeypatch.setattr("main.AzureSqlGraphStore", FakeSqlStore)
+    assert isinstance(create_store(), FakeSqlStore)
+
+
+def test_sql_table_reference_quotes_schema_and_table():
+    reference = _sql_table_reference("audit.process_graphs")
+    assert reference["object"] == "audit.process_graphs"
+    assert reference["quoted"] == "[audit].[process_graphs]"
+
+
+def test_sql_table_reference_rejects_unsafe_names():
+    with pytest.raises(ValueError):
+        _sql_table_reference("dbo.process_graphs;DROP_TABLE")
 
 
 def test_json_file_store_round_trip(tmp_path: Path):

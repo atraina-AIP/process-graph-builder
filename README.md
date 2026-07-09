@@ -77,15 +77,30 @@ docker compose up --build
 
 ### Backend storage
 
-The backend selects its storage layer from the environment:
+The backend selects its storage layer from the environment. Set
+`PROCESS_GRAPH_STORE_KIND` to force a backend:
 
-- **Local JSON file (default):** used when `COSMOS_URI` is unset. Graphs persist to the
-  path in `PROCESS_GRAPH_STORE` (defaults to `app/data/graphs.json`). Good for
+- `json` - local JSON file
+- `cosmos` - Azure Cosmos DB for NoSQL
+- `azure_sql` - Azure SQL Database
+
+If `PROCESS_GRAPH_STORE_KIND` is unset, the app keeps the existing auto-detect
+behavior: `COSMOS_URI` selects Cosmos, then an Azure SQL connection string selects
+Azure SQL, otherwise local JSON is used.
+
+- **Local JSON file (default):** graphs persist to the path in
+  `PROCESS_GRAPH_STORE` (defaults to `app/data/graphs.json`). Good for
   single-user dev; no Azure dependency needed at runtime.
-- **Azure Cosmos DB:** used when `COSMOS_URI` is set. Graphs are stored one document per
-  graph and mutation batches in a second container. Both containers partition by
-  `/tenant_id`. Cosmos-managed fields (`_etag`, `_ts`, ...) are stripped
-  before graphs are returned, so the public contract stays clean `snake_case`.
+- **Azure Cosmos DB for NoSQL:** graphs are stored one document per graph and
+  mutation batches in a second container. Both containers partition by
+  `/tenant_id`. Cosmos-managed fields (`_etag`, `_ts`, ...) are stripped before
+  graphs are returned, so the public contract stays clean `snake_case`.
+- **Azure SQL Database:** graphs are stored as canonical JSON documents in
+  `process_graphs`; mutation batches are appended to
+  `process_graph_mutation_batches`. Both tables are keyed by `tenant_id`, and
+  the API contract stays the same document-shaped JSON used by Cosmos.
+
+`GET /healthz` returns the selected storage backend in its `storage` field.
 
 Cosmos environment variables:
 
@@ -97,6 +112,34 @@ Cosmos environment variables:
 | `COSMOS_GRAPHS_CONTAINER` | no | `graphs` | Graph documents |
 | `COSMOS_MUTATION_BATCHES_CONTAINER` | no | `mutation_batches` | Audit log of applied batches |
 | `COSMOS_CREATE_IF_MISSING` | no | `true` | Create database/containers on startup; set `false` if the app identity lacks control-plane rights |
+
+Cosmos must be a Cosmos DB for NoSQL account endpoint such as
+`https://<account>.documents.azure.com:443/`. A Gremlin endpoint such as
+`wss://<account>.gremlin.cosmos.azure.com:443/` is not compatible with this
+adapter.
+
+Azure SQL environment variables:
+
+| Variable | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `AZURE_SQL_CONNECTION_STRING` | yes (to enable SQL) | - | ODBC connection string. `SQL_CONNECTION_STRING` is also accepted as a fallback name. |
+| `AZURE_SQL_CREATE_IF_MISSING` | no | `true` | Create tables/indexes on startup; set `false` if schema is managed separately. |
+| `AZURE_SQL_GRAPHS_TABLE` | no | `process_graphs` | One- or two-part table name for graph documents. |
+| `AZURE_SQL_MUTATION_BATCHES_TABLE` | no | `process_graph_mutation_batches` | One- or two-part table name for mutation-batch audit records. |
+
+Example Azure SQL connection string:
+
+```text
+Driver={ODBC Driver 18 for SQL Server};Server=tcp:<server>.database.windows.net,1433;Database=<database>;Authentication=ActiveDirectoryMsi;Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;
+```
+
+For local Azure SQL testing, use Python 3.12 and install the optional SQL
+dependency set:
+
+```powershell
+cd app
+pip install -r requirements-azure-sql.txt
+```
 
 Run the backend tests with:
 
