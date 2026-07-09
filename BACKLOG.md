@@ -667,6 +667,6 @@ the deterministic core unit-testable.
   JSON file store as the dev substitute (was "JSON graph persistence" / Postgres).
 - The app supports two coexisting modes — local-file/offline (default) and optional backend
   — rather than backend-by-default.
-- Current browser compiler remains the offline/default fallback. `POST /graph/assist` now has a feature-flagged server-side LLM path (`PROCESS_GRAPH_LLM_ASSIST_ENABLED=true` + request `use_llm: true`) with deterministic fallback on disablement or provider failure. Prompt examples now include DTA/data-to-action, network/distribution, manufacturing, and plant/structured-MILP authoring patterns generalized around transferable structure and relationship constraints rather than fixed NOR stage vocabulary.
+- Current browser compiler remains the offline/default fallback. `POST /graph/assist` now has a feature-flagged server-side LLM path (`PROCESS_GRAPH_LLM_ASSIST_ENABLED=true` + request `use_llm: true`) with deterministic fallback on disablement or provider failure. Prompt examples now include DTA/data-to-action, network/distribution, manufacturing, and plant/structured-MILP authoring patterns drawn from the plant schema/pipeline/NOR reference, generalized around transferable structure and relationship constraints rather than fixed NOR stage vocabulary.
 - Save/load started local (file Export/Import) and extends to backend persistence without
   changing the graph envelope.

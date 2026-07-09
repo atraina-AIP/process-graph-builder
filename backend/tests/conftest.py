@@ -16,6 +16,10 @@ if str(ROOT) not in sys.path:
 TEST_DATA_DIR = ROOT / ".test-data"
 TEST_DATA_DIR.mkdir(exist_ok=True)
 os.environ["PROCESS_GRAPH_STORE"] = str(TEST_DATA_DIR / "graphs-test.json")
+os.environ["PROCESS_GRAPH_ARTIFACT_STORE"] = str(TEST_DATA_DIR / "artifacts-test.json")
+os.environ["PROCESS_GRAPH_PROPERTY_GRAPH_SYNC_STORE"] = str(TEST_DATA_DIR / "property-graph-sync-test.json")
+os.environ.pop("COSMOS_GREMLIN_ENDPOINT", None)
+os.environ.pop("COSMOS_GREMLIN_HOST", None)
 
 import pytest  # noqa: E402
 
@@ -38,7 +42,15 @@ def tmp_path(request):
 def clean_store():
     """Start every test from an empty store."""
     store = Path(main_module.STORE_PATH)
+    artifact_store = Path(main_module.ARTIFACT_STORE_PATH)
+    property_graph_sync_store = Path(main_module.PROPERTY_GRAPH_SYNC_PATH)
     store.parent.mkdir(parents=True, exist_ok=True)
+    artifact_store.parent.mkdir(parents=True, exist_ok=True)
+    property_graph_sync_store.parent.mkdir(parents=True, exist_ok=True)
     store.write_text('{"tenants": {}}', encoding="utf-8")
+    artifact_store.write_text('{"schema_version": "artifact_ledger_v1", "tenants": {}}', encoding="utf-8")
+    property_graph_sync_store.write_text('{"schema_version": "property_graph_sync_v1", "tenants": {}}', encoding="utf-8")
     yield
     store.write_text('{"tenants": {}}', encoding="utf-8")
+    artifact_store.write_text('{"schema_version": "artifact_ledger_v1", "tenants": {}}', encoding="utf-8")
+    property_graph_sync_store.write_text('{"schema_version": "property_graph_sync_v1", "tenants": {}}', encoding="utf-8")

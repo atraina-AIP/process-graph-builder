@@ -16,8 +16,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from backend.artifacts import ArtifactStore, JsonFileArtifactStore
+from backend.graph_writer import PropertyGraphWriter, create_property_graph_writer
+from backend.property_graph import graph_to_property_graph, prepare_envelope_for_storage, prepare_graph_for_storage
+
 
 STORE_PATH = Path(os.environ.get("PROCESS_GRAPH_STORE", Path(__file__).parent / "data" / "graphs.json"))
+ARTIFACT_STORE_PATH = Path(os.environ.get("PROCESS_GRAPH_ARTIFACT_STORE", Path(__file__).parent / "data" / "artifacts.json"))
+PROPERTY_GRAPH_SYNC_PATH = Path(os.environ.get("PROCESS_GRAPH_PROPERTY_GRAPH_SYNC_STORE", Path(__file__).parent / "data" / "property-graph-sync.json"))
 STATIC_DIR = Path(os.environ.get("PROCESS_GRAPH_STATIC_DIR", Path(__file__).resolve().parents[1]))
 VERSION = os.environ.get("APP_VERSION", "dev")
 PRIVATE_GRAPH_DOCUMENT_FIELDS = {"frontend_envelope", "updated_at"}
@@ -199,6 +205,29 @@ class GraphEnvelopeRequest(BaseModel):
     envelope: dict[str, Any] = Field(default_factory=dict)
 
 
+class ArtifactSaveRequest(BaseModel):
+    """Request envelope for storing a full JSON artifact in the artifact ledger."""
+
+    artifact_id: str | None = None
+    artifact_type: str = "external_json"
+    source_format: str = "external_json"
+    name: str = ""
+    source_file_name: str = ""
+    round_trip_role: str = "source"
+    content: Any = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    validation: dict[str, Any] = Field(default_factory=dict)
+    parent_version_id: str | None = None
+    llm_edit_session_id: str | None = None
+
+
+class PropertyGraphSyncRequest(BaseModel):
+    """Request envelope for syncing the property-graph projection to its writer."""
+
+    dry_run: bool = False
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -238,6 +267,9 @@ def default_graph(graph_id: str = "pg-intake-to-close", tenant_id: str = "defaul
         "assumptions": [],
         "open_questions": [],
         "chat_messages": [],
+        "source_artifacts": [],
+        "artifact_refs": [],
+        "optimization_projection": {"target_format": "plant_json", "constraints": [], "objective": None, "validation": {}},
         "versions": [],
         "ontology": {
             "modeling_styles": {},
@@ -334,6 +366,7 @@ class JsonFileStore:
     def upsert_graph(self, tenant_id: str, graph: dict[str, Any]) -> None:
         store = self._load()
         bucket = self._tenant_bucket(store, tenant_id)
+        graph = prepare_graph_for_storage(graph, detach_artifact_content=False)
         bucket["graphs"][graph["id"]] = {**graph, "tenant_id": tenant_id}
         self._save(store)
 
@@ -368,6 +401,7 @@ class JsonFileStore:
     def upsert_envelope(self, tenant_id: str, graph_id: str, envelope: dict[str, Any]) -> None:
         store = self._load()
         bucket = self._tenant_bucket(store, tenant_id)
+        envelope = prepare_envelope_for_storage(envelope, detach_artifact_content=False)
         graph = envelope.get("graph") if isinstance(envelope.get("graph"), dict) else default_graph(graph_id, tenant_id)
         graph = {**_strip_cosmos_system_fields(graph), "id": graph_id, "tenant_id": tenant_id, "updated_at": now()}
         envelope = {**envelope, "graph": _strip_cosmos_system_fields(graph), "updated_at": graph["updated_at"]}
@@ -438,6 +472,7 @@ class CosmosGraphStore:
     def upsert_graph(self, tenant_id: str, graph: dict[str, Any]) -> None:
         from azure.cosmos import exceptions
 
+        graph = prepare_graph_for_storage(graph, detach_artifact_content=True)
         document = {**_strip_cosmos_system_fields(graph), "tenant_id": tenant_id, "updated_at": now()}
         existing = None
         try:
@@ -445,7 +480,9 @@ class CosmosGraphStore:
         except exceptions.CosmosResourceNotFoundError:
             existing = None
         if existing and existing.get("frontend_envelope"):
-            document["frontend_envelope"] = existing["frontend_envelope"]
+            document["frontend_envelope"] = prepare_envelope_for_storage(
+                existing["frontend_envelope"], detach_artifact_content=True
+            )
         self._graphs.upsert_item(document)
 
     def append_mutation_batch(self, tenant_id: str, batch: dict[str, Any]) -> None:
@@ -476,6 +513,7 @@ class CosmosGraphStore:
         return {"graph": _strip_cosmos_system_fields(item)}
 
     def upsert_envelope(self, tenant_id: str, graph_id: str, envelope: dict[str, Any]) -> None:
+        envelope = prepare_envelope_for_storage(envelope, detach_artifact_content=True)
         graph = envelope.get("graph") if isinstance(envelope.get("graph"), dict) else default_graph(graph_id, tenant_id)
         updated_at = now()
         document = {
@@ -501,6 +539,8 @@ def create_store() -> GraphStore:
 
 
 store: GraphStore = create_store()
+artifact_store: ArtifactStore = JsonFileArtifactStore(ARTIFACT_STORE_PATH)
+property_graph_writer: PropertyGraphWriter = create_property_graph_writer(PROPERTY_GRAPH_SYNC_PATH)
 
 
 def graph_summary(graph: dict[str, Any], updated_at: str = "") -> dict[str, Any]:
@@ -1045,6 +1085,37 @@ def list_graphs(tenant_id: str = Depends(resolve_tenant_id)) -> dict[str, list[d
     return {"graphs": store.list_graphs(tenant_id)}
 
 
+@app.get("/graph/{graph_id}/artifacts")
+def list_graph_artifacts(graph_id: str, tenant_id: str = Depends(resolve_tenant_id)) -> dict[str, list[dict[str, Any]]]:
+    return {"artifacts": artifact_store.list_artifacts(tenant_id, graph_id)}
+
+
+@app.post("/graph/{graph_id}/artifacts")
+def save_graph_artifact(
+    graph_id: str,
+    request: ArtifactSaveRequest,
+    tenant_id: str = Depends(resolve_tenant_id),
+) -> dict[str, Any]:
+    payload = request.model_dump()
+    if payload.get("content") is None:
+        raise HTTPException(status_code=422, detail="Artifact content is required")
+    artifact = artifact_store.save_artifact(tenant_id, graph_id, payload)
+    return {"artifact": artifact, "artifact_ref": artifact["artifact_ref"]}
+
+
+@app.get("/graph/{graph_id}/artifacts/{artifact_id}")
+def get_graph_artifact(
+    graph_id: str,
+    artifact_id: str,
+    version_id: str | None = None,
+    tenant_id: str = Depends(resolve_tenant_id),
+) -> dict[str, Any]:
+    artifact = artifact_store.get_artifact(tenant_id, graph_id, artifact_id, version_id=version_id, include_content=True)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return artifact
+
+
 @app.get("/graph/{graph_id}/envelope")
 def get_graph_envelope(graph_id: str, tenant_id: str = Depends(resolve_tenant_id)) -> dict[str, Any]:
     envelope = store.get_envelope(tenant_id, graph_id)
@@ -1077,6 +1148,38 @@ def save_graph_envelope(
 def get_graph(graph_id: str, tenant_id: str = Depends(resolve_tenant_id)) -> dict[str, Any]:
     return get_graph_or_create(store, tenant_id, graph_id)
 
+
+@app.get("/graph/{graph_id}/property-graph")
+def get_property_graph_projection(graph_id: str, tenant_id: str = Depends(resolve_tenant_id)) -> dict[str, Any]:
+    graph = store.get_graph(tenant_id, graph_id)
+    if graph is None:
+        raise HTTPException(status_code=404, detail="Graph not found")
+    return graph_to_property_graph(graph, tenant_id=tenant_id)
+
+
+@app.post("/graph/{graph_id}/property-graph/sync")
+def sync_property_graph_projection(
+    graph_id: str,
+    request: PropertyGraphSyncRequest = PropertyGraphSyncRequest(),
+    tenant_id: str = Depends(resolve_tenant_id),
+) -> dict[str, Any]:
+    graph = store.get_graph(tenant_id, graph_id)
+    if graph is None:
+        raise HTTPException(status_code=404, detail="Graph not found")
+    projection = graph_to_property_graph(graph, tenant_id=tenant_id)
+    try:
+        sync = property_graph_writer.sync_property_graph(projection, dry_run=request.dry_run)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "projection": {
+            "schema_version": projection.get("schema_version", ""),
+            "tenant_id": projection.get("tenant_id", ""),
+            "graph_id": projection.get("graph_id", ""),
+            "counts": projection.get("counts", {}),
+        },
+        "sync": sync,
+    }
 
 @app.post("/graph/mutate")
 def mutate_graph(request: MutateRequest, tenant_id: str = Depends(resolve_tenant_id)) -> dict[str, Any]:

@@ -3,3 +3,4 @@ uvicorn[standard]>=0.30
 azure-cosmos>=4.7
 azure-identity>=1.17
 openai>=1.93
+gremlinpython>=3.7

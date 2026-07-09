@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://example.local/process-graph.schema.json",
-  "$comment": "schema v5 — design-space annotations (variant_of/adoption on node, change on edge, value/cost on flow, top-level design_space); see design-space.schema.json. schema v4 (saved_views) — 2026-06-02: optional top-level `saved_views` array — persistent subgraph view definitions ({ id, name, filter }) that filter/focus the canonical graph without mutating it; each `filter` reuses the quick-filter shape (flow_kinds, edge_types, node_types, focus_selection, hops) and rides along in export. `active_view_id` stays session/UI state and is NOT part of this artifact. v4 base — 2026-06-02: resources are now first-class canvas nodes (node type \"resource\"; its kind/cost_rate/basis_unit live in node attributes) and \"X requires resource Y\" is an allocation edge from the consuming node to the resource node carrying the quantity. The top-level `resources` array and node/edge `resources_required` lists are now OPTIONAL/deprecated — tolerated for migration only, no longer produced or edited by the UI. v3 — 2026-06-02: optional top-level tenant_id stamped on every durable graph (Propel guardrail: no tenant-less production records; durable records are tenant-scoped). Constraint update (2026-06-02): constraints are now free-text — each constraint is a single hand-edited plain-language statement in `expression` (the source of truth); `type` is retained with a default but not shown in the UI; structured `fields` (target/scope/metric/operator/value/unit/notes) are optional and tolerated only for back-compat, no longer read or written by the editor. v2 — 2026-06-02: edge properties/perspectives/description/resources_required; node perspectives; cost resource type + basis_unit; descriptions on edges/resources/constraints; notes optional",
+  "$comment": "schema v6 - artifact_refs for server-backed artifact ledger pointers and graph-storage detachment; schema v5 — design-space annotations (variant_of/adoption on node, change on edge, value/cost on flow, top-level design_space); see design-space.schema.json. schema v4 (saved_views) — 2026-06-02: optional top-level `saved_views` array — persistent subgraph view definitions ({ id, name, filter }) that filter/focus the canonical graph without mutating it; each `filter` reuses the quick-filter shape (flow_kinds, edge_types, node_types, focus_selection, hops) and rides along in export. `active_view_id` stays session/UI state and is NOT part of this artifact. v4 base — 2026-06-02: resources are now first-class canvas nodes (node type \"resource\"; its kind/cost_rate/basis_unit live in node attributes) and \"X requires resource Y\" is an allocation edge from the consuming node to the resource node carrying the quantity. The top-level `resources` array and node/edge `resources_required` lists are now OPTIONAL/deprecated — tolerated for migration only, no longer produced or edited by the UI. v3 — 2026-06-02: optional top-level tenant_id stamped on every durable graph (Propel guardrail: no tenant-less production records; durable records are tenant-scoped). Constraint update (2026-06-02): constraints are now free-text — each constraint is a single hand-edited plain-language statement in `expression` (the source of truth); `type` is retained with a default but not shown in the UI; structured `fields` (target/scope/metric/operator/value/unit/notes) are optional and tolerated only for back-compat, no longer read or written by the editor. v2 — 2026-06-02: edge properties/perspectives/description/resources_required; node perspectives; cost resource type + basis_unit; descriptions on edges/resources/constraints; notes optional",
   "title": "ProcessGraph",
   "type": "object",
   "required": [
@@ -53,6 +53,21 @@
       "type": "object",
       "additionalProperties": true,
       "$comment": "Optional design-space export artifact (decision variables, objectives, budgets). Kept permissive here; see design-space.schema.json (#/$defs/design_space) for the full shape."
+    },
+    "optimization_projection": {
+      "type": "object",
+      "additionalProperties": true,
+      "$comment": "Optional solver/tool projection layer. Preserves LP/Plant JSON relationship terms, objective terms, time_config, validation, and provenance linked back to human-readable ProcessGraph constraints. Plain-language graph.constraints remains source intent."
+    },
+    "source_artifacts": {
+      "type": "array",
+      "items": { "type": "object", "additionalProperties": true },
+      "$comment": "Imported external artifacts (for example canonical Plant JSON) preserved for local file round-trip export and audit. Server-backed saves should store large content in the artifact ledger and leave graph records with artifact_refs."
+    },
+    "artifact_refs": {
+      "type": "array",
+      "items": { "type": "object", "additionalProperties": true },
+      "$comment": "Lightweight references to SQL/blob artifact records used by server-backed graph storage. Carries artifact_id, source_format, hash, byte size, storage_location, and round_trip_role without embedding the full JSON artifact in Cosmos graph records."
     },
     "assumptions": {
       "type": "array",

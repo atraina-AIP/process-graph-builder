@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import json
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -450,3 +451,115 @@ def test_cross_tenant_mutation_does_not_leak():
     b_nodes = {n["id"] for n in client.get(f"/graph/{graph_id}", headers={"X-Tenant-Id": "tenant_b"}).json()["nodes"]}
     assert a_nodes == {"only_a"}
     assert b_nodes == {"only_b"}
+
+
+def test_property_graph_projection_endpoint_returns_vertices_and_edges():
+    graph = default_graph("g-property-api", "wrong_tenant")
+    graph["name"] = "Property API"
+    graph["nodes"] = [
+        {"id": "n1", "name": "Source", "type": "source", "inputs": [], "outputs": ["ore"], "attributes": {}},
+        {"id": "n2", "name": "Mill", "type": "task", "inputs": ["ore"], "outputs": ["concentrate"], "attributes": {}},
+    ]
+    graph["edges"] = [
+        {"id": "e1", "from_node": "n1", "to_node": "n2", "type": "flow", "condition": "", "flows": []}
+    ]
+    graph["constraints"] = [
+        {"id": "c1", "type": "flow_balance", "expression": "Mill balances ore", "fields": {"target": "n2"}}
+    ]
+    graph["source_artifacts"] = [
+        {"id": "src_plant", "type": "plant_json", "format": "plant_json", "content": {"nodes": [], "edges": []}}
+    ]
+
+    save_response = client.put(
+        "/graph/g-property-api/envelope",
+        headers={"X-Tenant-Id": "tenant_graph"},
+        json={"envelope": {"graph": graph, "layout": {}}},
+    )
+    assert save_response.status_code == 200
+
+    response = client.get("/graph/g-property-api/property-graph", headers={"X-Tenant-Id": "tenant_graph"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tenant_id"] == "tenant_graph"
+    assert body["counts"]["process_nodes"] == 2
+    assert body["counts"]["process_edges"] == 1
+    assert body["counts"]["constraints"] == 1
+    assert body["counts"]["artifact_refs"] == 1
+    assert any(vertex["label"] == "artifact_ref" for vertex in body["vertices"])
+
+
+def test_property_graph_sync_endpoint_writes_local_sync_store():
+    graph = default_graph("g-property-sync", "wrong_tenant")
+    graph["name"] = "Property Sync"
+    graph["nodes"] = [
+        {"id": "n1", "name": "Source", "type": "source", "inputs": [], "outputs": ["ore"], "attributes": {}},
+        {"id": "n2", "name": "Mill", "type": "task", "inputs": ["ore"], "outputs": ["concentrate"], "attributes": {}},
+    ]
+    graph["edges"] = [
+        {"id": "e1", "from_node": "n1", "to_node": "n2", "type": "flow", "condition": "", "flows": []}
+    ]
+
+    save_response = client.put(
+        "/graph/g-property-sync/envelope",
+        headers={"X-Tenant-Id": "tenant_graph"},
+        json={"envelope": {"graph": graph, "layout": {}}},
+    )
+    assert save_response.status_code == 200
+
+    response = client.post(
+        "/graph/g-property-sync/property-graph/sync",
+        headers={"X-Tenant-Id": "tenant_graph"},
+        json={"dry_run": False},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["sync"]["writer"] == "json_file"
+    assert body["sync"]["vertices"] == body["projection"]["counts"]["vertices"]
+    assert body["projection"]["counts"]["process_nodes"] == 2
+
+    raw = json.loads(Path(main_module.PROPERTY_GRAPH_SYNC_PATH).read_text(encoding="utf-8"))
+    saved = raw["tenants"]["tenant_graph"]["graphs"]["g-property-sync"]
+    assert saved["latest_projection"]["counts"]["process_edges"] == 1
+
+
+def test_artifact_ledger_endpoints_round_trip():
+    payload = {
+        "artifact_id": "plant_src",
+        "artifact_type": "plant_json",
+        "source_format": "plant_json",
+        "name": "Plant source",
+        "source_file_name": "plant.json",
+        "round_trip_role": "source",
+        "content": {"nodes": [{"id": "n1"}], "edges": []},
+        "summary": {"node_count": 1},
+        "validation": {"valid": True, "errors": [], "warnings": []},
+    }
+    save_response = client.post(
+        "/graph/g-artifacts/artifacts",
+        headers={"X-Tenant-Id": "tenant_artifacts"},
+        json=payload,
+    )
+    assert save_response.status_code == 200
+    saved = save_response.json()
+    assert saved["artifact_ref"]["artifact_id"] == "plant_src"
+    assert saved["artifact_ref"]["source_format"] == "plant_json"
+    assert saved["artifact_ref"]["hash"]
+
+    list_response = client.get("/graph/g-artifacts/artifacts", headers={"X-Tenant-Id": "tenant_artifacts"})
+    assert list_response.status_code == 200
+    assert list_response.json()["artifacts"] == [saved["artifact_ref"]]
+
+    load_response = client.get(
+        "/graph/g-artifacts/artifacts/plant_src",
+        headers={"X-Tenant-Id": "tenant_artifacts"},
+    )
+    assert load_response.status_code == 200
+    loaded = load_response.json()
+    assert loaded["content"]["nodes"][0]["id"] == "n1"
+    assert loaded["artifact_ref"] == saved["artifact_ref"]
+
+    missing_response = client.get(
+        "/graph/g-artifacts/artifacts/plant_src",
+        headers={"X-Tenant-Id": "tenant_other"},
+    )
+    assert missing_response.status_code == 404

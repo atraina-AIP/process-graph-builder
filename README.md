@@ -95,18 +95,28 @@ Enable App Service Authentication with a Microsoft identity provider when deploy
 The backend selects its storage layer from the environment:
 
 - **Local JSON file (default):** used when `COSMOS_URI` is unset. Graphs, saved frontend envelopes, and mutation batches persist to the path in `PROCESS_GRAPH_STORE` (defaults to `backend/data/graphs.json`). Good for single-user dev; no Azure dependency needed at runtime.
-- **Azure Cosmos DB:** used when `COSMOS_URI` is set. Graphs and mutation batches are stored in separate containers, both partitioned by `/tenant_id`. Full frontend state is stored privately on graph documents as `frontend_envelope`; Cosmos-managed fields and private envelope fields are stripped before graphs are returned, so the public contract stays clean `snake_case`.
+- **Azure Cosmos DB:** used when `COSMOS_URI` is set. The current backend compatibility store keeps graphs and mutation batches in tenant-partitioned NoSQL containers and detaches embedded `source_artifacts.content` before Cosmos writes, leaving lightweight `artifact_refs` on the graph. The property-graph projection is exposed separately through `GET /graph/{id}/property-graph` and can be synced to Cosmos DB for Apache Gremlin with `POST /graph/{id}/property-graph/sync`.
+- **Artifact ledger:** full imported/exported JSON artifacts, Plant JSON snapshots, and LLM-edited artifact versions are stored outside the live graph. Local dev uses `PROCESS_GRAPH_ARTIFACT_STORE` (defaults to `backend/data/artifacts.json`); the Azure SQL target schema lives in `schema/artifact-ledger.sql`. Graph records point to these rows/files with `artifact_refs` rather than embedding multi-megabyte JSON in Cosmos.
 
-Cosmos environment variables:
+Cosmos and artifact environment variables:
 
 | Variable | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `COSMOS_URI` | yes (to enable Cosmos) | — | Account endpoint URL |
-| `COSMOS_KEY` | no | — | Account key; if omitted, `DefaultAzureCredential` (managed identity / `az login`) is used |
-| `COSMOS_DATABASE` | no | `process_graph_builder` | Database name |
-| `COSMOS_GRAPHS_CONTAINER` | no | `graphs` | Graph documents |
-| `COSMOS_MUTATION_BATCHES_CONTAINER` | no | `mutation_batches` | Audit log of applied batches |
-| `COSMOS_CREATE_IF_MISSING` | no | `true` | Create database/containers on startup; set `false` if the app identity lacks control-plane rights |
+| `COSMOS_URI` | yes (to enable Cosmos NoSQL store) | N/A | Account endpoint URL for the compatibility graph-document store |
+| `COSMOS_KEY` | no | N/A | Account key; if omitted, `DefaultAzureCredential` (managed identity / `az login`) is used for the NoSQL store |
+| `COSMOS_DATABASE` | no | `process_graph_builder` | Database name for the NoSQL store and default Gremlin database name |
+| `COSMOS_GRAPHS_CONTAINER` | no | `graphs` | Tenant-partitioned graph document container |
+| `COSMOS_MUTATION_BATCHES_CONTAINER` | no | `mutation_batches` | Tenant-partitioned audit log of applied mutation batches |
+| `COSMOS_CREATE_IF_MISSING` | no | `true` | Create NoSQL database/containers on startup; set `false` if the app identity lacks control-plane rights |
+| `PROCESS_GRAPH_ARTIFACT_STORE` | no | `backend/data/artifacts.json` | Local artifact ledger fallback for full JSON artifacts |
+| `PROCESS_GRAPH_PROPERTY_GRAPH_SYNC_STORE` | no | `backend/data/property-graph-sync.json` | Local fallback receipt/projection store for property-graph syncs |
+| `COSMOS_GREMLIN_ENDPOINT` | yes (to enable Gremlin sync) | N/A | Full WebSocket endpoint, for example `wss://<account>.gremlin.cosmos.azure.com:443/` |
+| `COSMOS_GREMLIN_HOST` | yes (alternative) | N/A | Gremlin host used when the full endpoint is not set |
+| `COSMOS_GREMLIN_DATABASE` | no | `COSMOS_DATABASE` or `process_graph_builder` | Gremlin database name |
+| `COSMOS_GREMLIN_GRAPH` | no | `process_graph` | Gremlin graph collection name |
+| `COSMOS_GREMLIN_KEY` | yes (for live Gremlin writes) | `COSMOS_KEY` | Gremlin account key; dry runs can report target config without a key |
+
+The Gremlin writer follows the Azure Cosmos DB for Apache Gremlin Python connection shape: `wss://...gremlin.cosmos.azure.com:443/`, username `/dbs/{database}/colls/{graph}`, and GraphSON v2 serialization. It is intentionally lazy: local/test runs use the JSON sync writer unless `COSMOS_GREMLIN_ENDPOINT` or `COSMOS_GREMLIN_HOST` is set.
 
 ### Optional LLM assist
 
@@ -121,7 +131,7 @@ $env:PROCESS_GRAPH_LLM_MODEL = "gpt-5.5"
 
 Then turn on **LLM assist** in the left chat panel. The browser still previews returned mutations before anything is applied. If the server flag is off, the key/package is missing, or the provider call fails, `/graph/assist` returns the deterministic compiler result with a warning. The request includes the current graph snapshot and recent chat messages so the model does not plan against stale persisted state.
 
-The server prompt includes domain examples for DTA/data-to-action, network/distribution, manufacturing, and plant/structured-MILP authoring. The plant example generalizes from the plant schema/pipeline/NOR reference material around transferable optimization structure: node roles, stable IDs, node-property names, `variableType`, units, `timeConfig`, relationship constraints, and objective hints as graph metadata for future exporters without embedding contracts into plant topology.
+The server prompt includes domain examples for DTA/data-to-action, network/distribution, manufacturing, and plant/structured-MILP authoring. The plant example is intentionally informed by `PLANT-JSON-SCHEMA.md`, `PLANT-PIPELINE.md`, and `norprod.json`, but it avoids treating NOR stage names as the abstraction. It teaches the model to preserve reusable optimization structure: node roles, stable IDs, node-property names, `variableType`, units, `timeConfig`, relationship constraints, and objective hints as graph metadata for future exporters without embedding contracts into plant topology.
 
 Run the backend tests with:
 
@@ -145,7 +155,7 @@ python -m pytest backend/tests -q
 
 ## MVP Notes
 
-The local compiler remains the offline deterministic fallback. A FastAPI-compatible backend exists under `backend/` with `GET /graph/{id}`, `GET /graph/{id}/envelope`, `PUT /graph/{id}/envelope`, `GET /graphs`, `GET /session`, `POST /graph/mutate`, `POST /graph/assist`, and `GET /graph/{id}/export/md`. The backend also serves the static frontend when run as the full app. The backend assist endpoint can use a server-side OpenAI-backed compiler only when `PROCESS_GRAPH_LLM_ASSIST_ENABLED=true` and the request sets `use_llm: true`; otherwise it returns the deterministic fallback compiler.
+The local compiler remains the offline deterministic fallback. A FastAPI-compatible backend exists under `backend/` with `GET /graph/{id}`, `GET /graph/{id}/envelope`, `PUT /graph/{id}/envelope`, `GET /graphs`, `GET /session`, `POST /graph/mutate`, `POST /graph/assist`, `GET/POST /graph/{id}/artifacts`, `GET /graph/{id}/property-graph`, `POST /graph/{id}/property-graph/sync`, and `GET /graph/{id}/export/md`. The backend also serves the static frontend when run as the full app. The backend assist endpoint can use a server-side OpenAI-backed compiler only when `PROCESS_GRAPH_LLM_ASSIST_ENABLED=true` and the request sets `use_llm: true`; otherwise it returns the deterministic fallback compiler.
 
 Ontology is stored inside the graph and can be inferred from current graph contents. Directed edges imply precedence, while edge flow payloads describe what moves. Constraint `expression` is kept for export compatibility, but the UI now edits structured fields and regenerates the expression.
 

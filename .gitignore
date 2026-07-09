@@ -7,6 +7,11 @@ tmp-check/
 .test-data/
 *.tmp
 
+
+# Local/company data samples; keep these out of GitHub.
+norProd.json
+noProd.json
+
 .venv/
 venv/
 env/

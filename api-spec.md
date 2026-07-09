@@ -20,9 +20,7 @@ Returns the resolved backend identity context used by the frontend to confirm ba
   "tenant_id": "default",
   "user_id": "",
   "user_name": "",
-  "source": "default",
-  "llm_assist_available": false,
-  "llm_model": ""
+  "source": "default"
 }
 ```
 
@@ -68,6 +66,125 @@ Saves the full frontend state envelope for the resolved tenant. The request body
     "mutation_log": [],
     "open_questions": [],
     "canvas_view": { "x": 0, "y": 0, "zoom": 1 }
+  }
+}
+```
+
+## GET /graph/{id}/artifacts
+
+Lists artifact refs for full JSON artifacts associated with the graph. The frontend uses these refs in `graph.artifact_refs` and keeps large content out of Cosmos graph records.
+
+```json
+{
+  "artifacts": [
+    {
+      "id": "src_plant",
+      "artifact_id": "src_plant",
+      "artifact_type": "plant_json",
+      "source_format": "plant_json",
+      "name": "NOR production",
+      "hash": "...sha256...",
+      "bytes": 7350000,
+      "storage_location": "artifact_ledger",
+      "round_trip_role": "source",
+      "version_id": "artv_..."
+    }
+  ]
+}
+```
+
+## POST /graph/{id}/artifacts
+
+Stores a full JSON artifact version and returns a lightweight ref. Local dev writes to `PROCESS_GRAPH_ARTIFACT_STORE`; the Azure SQL target schema is `schema/artifact-ledger.sql`.
+
+```json
+{
+  "artifact_id": "src_plant",
+  "artifact_type": "plant_json",
+  "source_format": "plant_json",
+  "name": "NOR production",
+  "source_file_name": "norProd.json",
+  "round_trip_role": "source",
+  "content": { "nodes": [], "edges": [] },
+  "summary": { "node_count": 37 },
+  "validation": { "valid": true, "errors": [], "warnings": [] }
+}
+```
+
+## GET /graph/{id}/artifacts/{artifact_id}
+
+Returns one artifact version including its full `content`. Optional query: `version_id`.
+
+## GET /graph/{id}/property-graph
+
+Returns a read-only property-graph projection of the stored ProcessGraph for Cosmos-as-graph writers and diagnostics. The projection has stable vertex/edge records; full JSON artifacts are represented as `artifact_ref` vertices, not embedded payloads.
+
+```json
+{
+  "schema_version": "property_graph_v1",
+  "tenant_id": "default",
+  "graph_id": "pg-make-to-order",
+  "vertices": [
+    {
+      "id": "pg-make-to-order::node::n1",
+      "label": "process_node",
+      "record_kind": "node",
+      "tenant_id": "default",
+      "graph_id": "pg-make-to-order",
+      "source_id": "n1",
+      "properties": { "name": "Cut", "node_type": "task" }
+    }
+  ],
+  "edges": [
+    {
+      "id": "pg-make-to-order::process_edge::e1",
+      "label": "flow",
+      "record_kind": "process_edge",
+      "out_v": "pg-make-to-order::node::n1",
+      "in_v": "pg-make-to-order::node::n2",
+      "properties": { "flows": [] }
+    }
+  ],
+  "counts": {
+    "vertices": 1,
+    "edges": 1,
+    "process_nodes": 1,
+    "process_edges": 1,
+    "constraints": 0,
+    "artifact_refs": 0
+  }
+}
+```
+
+## POST /graph/{id}/property-graph/sync
+
+Projects the stored ProcessGraph and syncs it through the configured property-graph writer. Local dev writes a sync receipt and latest projection to `PROCESS_GRAPH_PROPERTY_GRAPH_SYNC_STORE`. When `COSMOS_GREMLIN_ENDPOINT` or `COSMOS_GREMLIN_HOST` is set, the backend writes vertices and edges to Cosmos DB for Apache Gremlin.
+
+```json
+{
+  "dry_run": false
+}
+```
+
+Response:
+
+```json
+{
+  "projection": {
+    "schema_version": "property_graph_v1",
+    "tenant_id": "default",
+    "graph_id": "pg-make-to-order",
+    "counts": { "vertices": 6, "edges": 5, "process_nodes": 2, "process_edges": 1 }
+  },
+  "sync": {
+    "schema_version": "property_graph_sync_v1",
+    "writer": "json_file",
+    "dry_run": false,
+    "tenant_id": "default",
+    "graph_id": "pg-make-to-order",
+    "vertices": 6,
+    "edges": 5,
+    "details": {}
   }
 }
 ```

@@ -3,8 +3,6 @@
 const STORAGE_KEY = "process-graph-builder-state-v1";
 const LIBRARY_KEY = "process-graph-builder-library-v1";
 const API_BASE_STORAGE_KEY = "process-graph-builder-api-base";
-const TENANT_STORAGE_KEY = "process-graph-builder-tenant-id";
-const LLM_ASSIST_STORAGE_KEY = "process-graph-builder-llm-assist-enabled";
 const CURRENT_SAMPLE_GRAPH_ID = "pg-make-to-order";
 const LEGACY_SAMPLE_GRAPH_IDS = ["pg-intake-to-close"];
 const LEGACY_SAMPLE_GRAPH_NAMES = ["Intake to Close", "Supplier Invoice to Posted", "Invoice to Posted"];
@@ -12,7 +10,7 @@ const LEGACY_SAMPLE_GRAPH_NAMES = ["Intake to Close", "Supplier Invoice to Poste
 // Current graph-schema version, mirroring the `$comment` version in
 // schema/process-graph.schema.json. Stamped into the export envelope
 // (P0-0) so downstream tools know which contract an artifact targets.
-const SCHEMA_VERSION = "v6";
+const SCHEMA_VERSION = "v5";
 
 const MODELING_STYLES = ["none", "business_process", "value_stream", "system_flow", "team_topology", "custom"];
 const NODE_TYPES = ["source", "sink", "task", "decision", "resource"];
@@ -425,13 +423,7 @@ Allowed mutations:
 - add_constraint
 - update_constraint
 - add_assumption
-- add_question
-
-Few-shot examples used by the server-side LLM prompt:
-- DTA / data-to-action: telemetry or transaction data -> analytics/model scoring -> human review -> approved action system; preserve data, information, approval, and work flows separately.
-- Network / distribution: supplier, DC, store/customer, and returns nodes; represent physical movement as parts/material flows and return loops as feedback.
-- Manufacturing: order/MRP -> material preparation -> machine/process -> quality decision -> assembly/rework -> ship; represent pass/fail conditions, resources, material/data flows, and routing constraints.
-- Plant / structured MILP: preserve reusable optimization structure: node roles, stable IDs, node.property names, variableType hints, units, timeConfig, material-flow metadata, relationship constraints, and objective hints as graph metadata/constraints for future exporters; stage names are examples only, and contracts do not belong in plant topology.`;
+- add_question`;
 
 const sampleGraph = {
   id: CURRENT_SAMPLE_GRAPH_ID,
@@ -528,13 +520,6 @@ let canvasView = { x: 0, y: 0, zoom: 1 };
 let activeFilter = createEmptyFilter();
 let currentFileHandle = null;
 let currentFileName = "";
-let backendAvailable = null;
-let backendSession = null;
-let llmAssistEnabled = false;
-let cloudLibrary = { graphs: [] };
-let cloudLibraryLoaded = false;
-let cloudLibraryStatus = "local";
-const artifactContentCache = new Map();
 // In-memory id of the saved view whose filter is currently applied (null when
 // the active filter is a custom/unsaved combination). Persisted as UI state in
 // the envelope (active_view_id) but never stored on the graph.
@@ -547,7 +532,6 @@ document.addEventListener("DOMContentLoaded", () => {
   loadState();
   bindEvents();
   render();
-  hydrateFromBackendOnLoad();
 });
 
 function bindElements() {
@@ -588,7 +572,6 @@ function bindElements() {
     "closeValidationButton",
     "validationStatusDot",
     "saveExportDesignSpaceButton",
-    "saveExportPlantJsonButton",
     "openDesignSpaceButton",
     "designSpaceDialog",
     "closeDesignSpaceButton",
@@ -605,8 +588,6 @@ function bindElements() {
     "applyPlanButton",
     "discardPlanButton",
     "undoButton",
-    "llmAssistToggle",
-    "llmAssistStatus",
     "chatScroll",
     "planPreview",
     "planStatus",
@@ -685,15 +666,6 @@ function bindEvents() {
       planFromInstruction();
     }
   });
-
-  if (els.llmAssistToggle) {
-    els.llmAssistToggle.addEventListener("change", () => {
-      llmAssistEnabled = Boolean(els.llmAssistToggle.checked);
-      localStorage.setItem(LLM_ASSIST_STORAGE_KEY, String(llmAssistEnabled));
-      renderLlmAssistToggle();
-      saveState();
-    });
-  }
 
   els.applyPlanButton.addEventListener("click", () => {
     if (!pendingPlan) return;
@@ -776,7 +748,6 @@ function bindEvents() {
   els.openDesignSpaceButton.addEventListener("click", openDesignSpaceDialog);
   els.closeDesignSpaceButton.addEventListener("click", closeDesignSpaceDialog);
   els.saveExportDesignSpaceButton.addEventListener("click", downloadDesignSpaceJson);
-  els.saveExportPlantJsonButton.addEventListener("click", downloadPlantJson);
   // Text inputs patch state in place (no re-render, preserves focus); add/delete
   // and select changes re-render the dialog.
   els.designSpaceObjectives.addEventListener("input", handleDesignSpaceObjectiveInput);
@@ -883,8 +854,6 @@ function applyEnvelopeToState(env) {
   const savedAllowCycles = readEnvelopeField(env, "allow_cycles", "allowCycles", undefined);
   allowCycles = savedAllowCycles !== undefined ? Boolean(savedAllowCycles) : true;
   validateCurrentView = Boolean(readEnvelopeField(env, "validate_current_view", "validateCurrentView", false));
-  const savedLlmAssist = readEnvelopeField(env, "llm_assist_enabled", "llmAssistEnabled", undefined);
-  llmAssistEnabled = savedLlmAssist !== undefined ? Boolean(savedLlmAssist) : localStorage.getItem(LLM_ASSIST_STORAGE_KEY) === "true";
   addNodeFormOpen = Boolean(readEnvelopeField(env, "add_node_form_open", "addNodeFormOpen", false));
   leftPanelCollapsed = Boolean(readEnvelopeField(env, "left_panel_collapsed", "leftPanelCollapsed", false));
   legendCollapsed = Boolean(readEnvelopeField(env, "legend_collapsed", "legendCollapsed", false));
@@ -902,7 +871,6 @@ function applyEnvelopeToState(env) {
 }
 
 function loadState() {
-  llmAssistEnabled = localStorage.getItem(LLM_ASSIST_STORAGE_KEY) === "true";
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
     if (!saved || !saved.graph) return;
@@ -946,7 +914,6 @@ function serializeState() {
     open_questions: openQuestions,
     allow_cycles: allowCycles,
     validate_current_view: validateCurrentView,
-    llm_assist_enabled: llmAssistEnabled,
     add_node_form_open: addNodeFormOpen,
     left_panel_collapsed: leftPanelCollapsed,
     legend_collapsed: legendCollapsed,
@@ -960,11 +927,7 @@ function serializeState() {
 }
 
 function saveState() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(serializeState()));
-  } catch (error) {
-    console.warn("Unable to save graph state locally", error);
-  }
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(serializeState()));
 }
 
 // --- Graph library (named save/load) ---------------------------------------
@@ -980,14 +943,7 @@ function loadLibrary() {
 }
 
 function saveLibrary(library) {
-  try {
-    localStorage.setItem(LIBRARY_KEY, JSON.stringify(library));
-    return true;
-  } catch (error) {
-    console.warn("Unable to save graph library locally", error);
-    toast("Local library storage is full; use Save as JSON file for large plant round-trips");
-    return false;
-  }
+  localStorage.setItem(LIBRARY_KEY, JSON.stringify(library));
 }
 
 function libraryEntryId(name) {
@@ -1000,12 +956,9 @@ function formatTimestamp(iso) {
   return Number.isNaN(date.getTime()) ? "unknown" : date.toLocaleString();
 }
 
-async function saveCurrentToLibrary(name) {
+function saveCurrentToLibrary(name) {
   const cleanName = (name || "").trim() || graph.name || "Untitled Process Graph";
   graph.name = cleanName;
-
-  if (await saveCurrentToCloudLibrary(cleanName)) return;
-
   const library = loadLibrary();
   const envelope = clone(serializeState());
   const timestamp = new Date().toISOString();
@@ -1026,48 +979,14 @@ async function saveCurrentToLibrary(name) {
       envelope,
     });
   }
-  if (!saveLibrary(library)) return;
+  saveLibrary(library);
   saveState();
   renderLibrary();
   closeSaveDialog();
-  toast(existing ? `Updated "${cleanName}" in local library` : `Saved "${cleanName}" to local library`);
+  toast(existing ? `Updated "${cleanName}" in library` : `Saved "${cleanName}" to library`);
 }
 
-async function saveCurrentToCloudLibrary(cleanName) {
-  if (!(await isBackendAvailable())) return false;
-  const base = apiBase();
-  const envelope = clone(serializeState());
-  envelope.graph = clone(graph);
-  try {
-    const response = await fetch(`${base}/graph/${encodeURIComponent(graph.id)}/envelope`, {
-      method: "PUT",
-      headers: backendJsonHeaders(),
-      body: JSON.stringify({ envelope }),
-    });
-    if (!response.ok) {
-      toast(`Cloud save failed (status ${response.status}); saved locally instead.`);
-      return false;
-    }
-    await refreshCloudLibrary({ silent: true });
-    saveState();
-    renderLibrary();
-    closeSaveDialog();
-    toast(`Saved "${cleanName}" to cloud library`);
-    return true;
-  } catch (error) {
-    console.warn("Unable to save to cloud library", error);
-    toast("Cloud save unavailable; saved locally instead.");
-    backendAvailable = false;
-    return false;
-  }
-}
-
-async function loadFromLibrary(entryId) {
-  if (cloudLibraryLoaded) {
-    await loadFromCloudLibrary(entryId);
-    return;
-  }
-
+function loadFromLibrary(entryId) {
   const library = loadLibrary();
   const entry = library.graphs.find((item) => item.id === entryId);
   if (!entry || !entry.envelope) {
@@ -1085,40 +1004,7 @@ async function loadFromLibrary(entryId) {
   toast(`Loaded "${entry.name}"`);
 }
 
-async function loadFromCloudLibrary(entryId) {
-  const base = apiBase();
-  try {
-    const response = await fetch(`${base}/graph/${encodeURIComponent(entryId)}/envelope`, {
-      headers: backendHeaders(),
-    });
-    if (!response.ok) {
-      toast(`Cloud graph load failed (status ${response.status})`);
-      return;
-    }
-    const envelope = await response.json();
-    if (!envelope?.graph) {
-      toast("Cloud graph did not include a graph envelope");
-      return;
-    }
-    applyEnvelopeToState(envelope);
-    clearCurrentFileHandle();
-    pendingPlan = null;
-    clarificationContext = null;
-    renderPlan();
-    render();
-    closeLibrary();
-    toast(`Loaded "${envelope.graph.name || entryId}" from cloud`);
-  } catch (error) {
-    console.warn("Unable to load cloud graph", error);
-    toast("Could not load cloud graph");
-  }
-}
-
 function duplicateLibraryEntry(entryId) {
-  if (cloudLibraryLoaded) {
-    toast("Duplicate is available for local library entries only");
-    return;
-  }
   const library = loadLibrary();
   const entry = library.graphs.find((item) => item.id === entryId);
   if (!entry) return;
@@ -1137,10 +1023,6 @@ function duplicateLibraryEntry(entryId) {
 }
 
 function deleteLibraryEntry(entryId) {
-  if (cloudLibraryLoaded) {
-    toast("Delete is not enabled for cloud library entries yet");
-    return;
-  }
   const library = loadLibrary();
   const entry = library.graphs.find((item) => item.id === entryId);
   if (!entry) return;
@@ -1151,22 +1033,12 @@ function deleteLibraryEntry(entryId) {
   toast(`Deleted "${entry.name}"`);
 }
 
-function activeLibrary() {
-  return cloudLibraryLoaded ? cloudLibrary : loadLibrary();
-}
-
 function renderLibrary() {
   if (!els.libraryList) return;
-  if (cloudLibraryStatus === "loading") {
-    els.libraryList.innerHTML = `<div class="library-empty">Loading cloud library...</div>`;
-    return;
-  }
-  const isCloud = cloudLibraryLoaded;
-  const library = activeLibrary();
+  const library = loadLibrary();
   const entries = [...library.graphs].sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
   if (!entries.length) {
-    const target = isCloud ? "cloud library" : "local library";
-    els.libraryList.innerHTML = `<div class="library-empty">No saved graphs yet. Use Save to add the current graph to the ${target}.</div>`;
+    els.libraryList.innerHTML = `<div class="library-empty">No saved graphs yet. Use Save to add the current graph to the library.</div>`;
     return;
   }
   els.libraryList.innerHTML = entries
@@ -1174,20 +1046,16 @@ function renderLibrary() {
       const nodeCount = entry.envelope?.graph?.nodes?.length ?? entry.node_count ?? 0;
       const edgeCount = entry.envelope?.graph?.edges?.length ?? entry.edge_count ?? 0;
       const updated = formatTimestamp(entry.updated_at || entry.saved_at);
-      const source = isCloud ? "Cloud" : "Local";
-      const localActions = isCloud
-        ? ""
-        : `<button class="button secondary" type="button" data-library-action="duplicate">Duplicate</button>
-           <button class="button secondary danger" type="button" data-library-action="delete">Delete</button>`;
       return `
         <div class="library-row" data-entry-id="${escapeAttribute(entry.id)}">
           <div class="library-row-main">
             <strong>${escapeHtml(entry.name)}</strong>
-            <span>${source} | ${nodeCount} nodes | ${edgeCount} edges | ${escapeHtml(updated)}</span>
+            <span>${nodeCount} nodes · ${edgeCount} edges · ${escapeHtml(updated)}</span>
           </div>
           <div class="library-row-actions">
             <button class="button secondary" type="button" data-library-action="load">Load</button>
-            ${localActions}
+            <button class="button secondary" type="button" data-library-action="duplicate">Duplicate</button>
+            <button class="button secondary danger" type="button" data-library-action="delete">Delete</button>
           </div>
         </div>
       `;
@@ -1195,40 +1063,12 @@ function renderLibrary() {
     .join("");
 }
 
-async function openLibrary() {
-  cloudLibraryStatus = "loading";
+function openLibrary() {
   renderLibrary();
   if (typeof els.libraryDialog.showModal === "function") {
     els.libraryDialog.showModal();
   } else {
     els.libraryDialog.setAttribute("open", "");
-  }
-  await refreshCloudLibrary();
-  renderLibrary();
-}
-
-async function refreshCloudLibrary(options = {}) {
-  const settings = { silent: false, ...options };
-  if (!(await isBackendAvailable())) {
-    cloudLibraryLoaded = false;
-    cloudLibraryStatus = "local";
-    return false;
-  }
-  cloudLibraryStatus = "loading";
-  try {
-    const response = await fetch(`${apiBase()}/graphs`, { headers: backendHeaders() });
-    if (!response.ok) throw new Error(`status ${response.status}`);
-    const body = await response.json();
-    cloudLibrary = { graphs: Array.isArray(body.graphs) ? body.graphs : [] };
-    cloudLibraryLoaded = true;
-    cloudLibraryStatus = "cloud";
-    return true;
-  } catch (error) {
-    console.warn("Unable to load cloud graph library", error);
-    cloudLibraryLoaded = false;
-    cloudLibraryStatus = "local";
-    if (!settings.silent) toast("Cloud library unavailable; showing local library");
-    return false;
   }
 }
 
@@ -1636,9 +1476,6 @@ function ensureGraphShape() {
   graph.modeling_style = MODELING_STYLES.includes(graph.modeling_style) ? graph.modeling_style : "none";
   graph.ontology = mergeOntology(DEFAULT_ONTOLOGY, graph.ontology || {});
   graph.saved_views = normalizeSavedViews(graph.saved_views);
-  graph.source_artifacts = normalizeSourceArtifacts(graph.source_artifacts);
-  graph.artifact_refs = normalizeArtifactRefs(graph.artifact_refs, graph.source_artifacts);
-  graph.optimization_projection = normalizeOptimizationProjection(graph.optimization_projection);
   // DS-2: authored objectives/budgets/notes (variables are derived, NOT stored).
   graph.design_space = normalizeDesignSpace(graph.design_space);
 
@@ -1896,7 +1733,6 @@ function render() {
   normalizeLayout();
   renderPanelCollapse();
   renderModelingStyle();
-  renderLlmAssistToggle();
   renderChatMessages();
   renderCanvas();
   renderNotationLegend();
@@ -1919,27 +1755,6 @@ function renderPlan() {
   els.planPreview.textContent = JSON.stringify(pendingPlan || {}, null, 2);
 }
 
-function renderLlmAssistToggle() {
-  if (!els.llmAssistToggle) return;
-  els.llmAssistToggle.checked = Boolean(llmAssistEnabled);
-  if (!els.llmAssistStatus) return;
-  if (!llmAssistEnabled) {
-    els.llmAssistStatus.textContent = "Off: deterministic compiler";
-    return;
-  }
-  if (backendAvailable === false) {
-    els.llmAssistStatus.textContent = "On locally; backend unavailable";
-    return;
-  }
-  if (backendSession?.llm_assist_available === false) {
-    els.llmAssistStatus.textContent = "On locally; server flag off";
-    return;
-  }
-  els.llmAssistStatus.textContent = backendSession?.llm_model
-    ? `On: ${backendSession.llm_model}`
-    : "On: ask backend LLM";
-}
-
 async function planFromInstruction() {
   const message = els.chatInput.value.trim();
   pendingPlan = (await requestBackendAssist(message)) || compileWithClarification(message);
@@ -1953,42 +1768,14 @@ async function planFromInstruction() {
   saveState();
 }
 
-async function hydrateFromBackendOnLoad() {
-  if (!(await isBackendAvailable())) return;
-  const graphId = graph?.id || CURRENT_SAMPLE_GRAPH_ID;
-  try {
-    const response = await fetch(`${apiBase()}/graph/${encodeURIComponent(graphId)}/envelope`, {
-      headers: backendHeaders(),
-    });
-    if (response.status === 404) return;
-    if (!response.ok) throw new Error(`status ${response.status}`);
-    const envelope = await response.json();
-    if (!envelope?.graph) return;
-    applyEnvelopeToState(envelope);
-    pendingPlan = null;
-    clarificationContext = null;
-    renderPlan();
-    render();
-  } catch (error) {
-    console.warn("Unable to hydrate graph from backend", error);
-  }
-}
-
 async function requestBackendAssist(message) {
-  if (clarificationContext?.plan?.questions?.length) return null;
-  if (!(await isBackendAvailable())) return null;
   const base = apiBase();
+  if (!base || clarificationContext?.plan?.questions?.length) return null;
   try {
     const response = await fetch(`${base}/graph/assist`, {
       method: "POST",
-      headers: backendJsonHeaders(),
-      body: JSON.stringify({
-        graph_id: graph.id,
-        user_message: message,
-        graph: clone(graph),
-        chat_messages: chatMessages.slice(-12),
-        use_llm: llmAssistEnabled,
-      }),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ graph_id: graph.id, user_message: message }),
     });
     if (!response.ok) {
       notifyBackendFailure(`Backend assist failed (status ${response.status}). Using the local planner instead.`);
@@ -1996,26 +1783,24 @@ async function requestBackendAssist(message) {
     }
     return await response.json();
   } catch {
-    backendAvailable = false;
     notifyBackendFailure("Could not reach the backend for assist. Using the local planner instead.");
     return null;
   }
 }
 
 async function syncBackendMutations(mutations) {
-  if (!mutations.length || !(await isBackendAvailable())) return;
   const base = apiBase();
+  if (!base || !mutations.length) return;
   try {
     const response = await fetch(`${base}/graph/mutate`, {
       method: "POST",
-      headers: backendJsonHeaders(),
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ graph_id: graph.id, mutations }),
     });
     if (!response.ok) {
       notifyBackendSyncFailure(`Backend sync failed (status ${response.status}). Your changes are saved locally.`);
     }
   } catch {
-    backendAvailable = false;
     notifyBackendSyncFailure("Could not reach the backend to sync. Your changes are saved locally.");
   }
 }
@@ -2050,142 +1835,8 @@ function notifyBackendSyncFailure(text) {
   saveState();
 }
 
-function explicitApiBase() {
-  return (localStorage.getItem(API_BASE_STORAGE_KEY) || window.PROCESS_GRAPH_API_BASE || "").replace(/\/+$/, "");
-}
-
 function apiBase() {
-  const explicit = explicitApiBase();
-  if (explicit) return explicit;
-  if (window.location.protocol === "http:" || window.location.protocol === "https:") {
-    return window.location.origin.replace(/\/+$/, "");
-  }
-  return "";
-}
-
-function backendHeaders() {
-  const headers = {};
-  const tenantId = (localStorage.getItem(TENANT_STORAGE_KEY) || "").trim();
-  if (tenantId) headers["X-Tenant-Id"] = tenantId;
-  return headers;
-}
-
-function backendJsonHeaders() {
-  return { "Content-Type": "application/json", ...backendHeaders() };
-}
-
-function artifactCacheKeys(refOrArtifact) {
-  return [refOrArtifact?.artifact_id, refOrArtifact?.id, refOrArtifact?.content_ref, refOrArtifact?.version_id]
-    .filter((value) => typeof value === "string" && value.trim());
-}
-
-function rememberArtifactContent(refOrArtifact, content) {
-  artifactCacheKeys(refOrArtifact).forEach((key) => artifactContentCache.set(key, content));
-}
-
-function cachedArtifactContent(refOrArtifact) {
-  for (const key of artifactCacheKeys(refOrArtifact)) {
-    if (artifactContentCache.has(key)) return artifactContentCache.get(key);
-  }
-  return null;
-}
-
-async function saveGraphArtifact(graphId, payload) {
-  if (!(await isBackendAvailable())) return null;
-  try {
-    const response = await fetch(`${apiBase()}/graph/${encodeURIComponent(graphId)}/artifacts`, {
-      method: "POST",
-      headers: backendJsonHeaders(),
-      body: JSON.stringify(payload),
-    });
-    if (!response.ok) throw new Error(`status ${response.status}`);
-    return await response.json();
-  } catch (error) {
-    console.warn("Unable to save graph artifact", error);
-    return null;
-  }
-}
-
-async function loadGraphArtifact(graphId, refOrArtifact) {
-  const artifactId = refOrArtifact?.artifact_id || refOrArtifact?.content_ref || refOrArtifact?.id;
-  if (!artifactId || !(await isBackendAvailable())) return null;
-  const query = refOrArtifact?.version_id ? `?version_id=${encodeURIComponent(refOrArtifact.version_id)}` : "";
-  try {
-    const response = await fetch(`${apiBase()}/graph/${encodeURIComponent(graphId)}/artifacts/${encodeURIComponent(artifactId)}${query}`, {
-      headers: backendHeaders(),
-    });
-    if (!response.ok) throw new Error(`status ${response.status}`);
-    const artifact = await response.json();
-    if (artifact?.content !== undefined) rememberArtifactContent(artifact.artifact_ref || refOrArtifact, artifact.content);
-    return artifact;
-  } catch (error) {
-    console.warn("Unable to load graph artifact", error);
-    return null;
-  }
-}
-
-function upsertArtifactRef(targetGraph, artifactRef) {
-  if (!artifactRef) return;
-  const refs = Array.isArray(targetGraph.artifact_refs) ? targetGraph.artifact_refs.slice() : [];
-  const id = artifactRef.id || artifactRef.artifact_id;
-  const index = refs.findIndex((ref) => (ref.id || ref.artifact_id) === id);
-  if (index >= 0) refs[index] = { ...refs[index], ...artifactRef };
-  else refs.push(artifactRef);
-  targetGraph.artifact_refs = normalizeArtifactRefs(refs, targetGraph.source_artifacts || []);
-}
-
-function upsertSourceArtifactRef(targetGraph, artifactRef, fallback = {}) {
-  if (!artifactRef) return;
-  const sourceArtifacts = Array.isArray(targetGraph.source_artifacts) ? targetGraph.source_artifacts.slice() : [];
-  const id = artifactRef.artifact_id || artifactRef.id;
-  const next = {
-    id,
-    artifact_id: id,
-    type: artifactRef.artifact_type || fallback.type || "external_json",
-    format: artifactRef.source_format || fallback.format || "external_json",
-    name: artifactRef.name || fallback.name || "Imported artifact",
-    source_file_name: artifactRef.source_file_name || fallback.source_file_name || "",
-    imported_at: artifactRef.created_at || fallback.imported_at || new Date().toISOString(),
-    content_ref: id,
-    version_id: artifactRef.version_id || fallback.version_id || "",
-    storage_location: artifactRef.storage_location || "artifact_ledger",
-    round_trip_role: artifactRef.round_trip_role || fallback.round_trip_role || "source",
-    hash: artifactRef.hash || fallback.hash || "",
-    bytes: artifactRef.bytes ?? fallback.bytes ?? null,
-    summary: artifactRef.summary || fallback.summary || {},
-  };
-  const index = sourceArtifacts.findIndex((artifact) => (artifact.artifact_id || artifact.content_ref || artifact.id) === id);
-  if (index >= 0) {
-    sourceArtifacts[index] = { ...sourceArtifacts[index], ...next };
-    delete sourceArtifacts[index].content;
-  } else {
-    sourceArtifacts.push(next);
-  }
-  targetGraph.source_artifacts = normalizeSourceArtifacts(sourceArtifacts);
-}
-async function isBackendAvailable() {
-  if (backendAvailable !== null) return backendAvailable;
-  const base = apiBase();
-  if (!base) {
-    backendAvailable = false;
-    return false;
-  }
-  try {
-    const response = await fetch(`${base}/healthz`, { headers: backendHeaders(), cache: "no-store" });
-    backendAvailable = response.ok;
-    if (backendAvailable) {
-      try {
-        const sessionResponse = await fetch(`${base}/session`, { headers: backendHeaders(), cache: "no-store" });
-        backendSession = sessionResponse.ok ? await sessionResponse.json() : null;
-        renderLlmAssistToggle();
-      } catch {
-        backendSession = null;
-      }
-    }
-  } catch {
-    backendAvailable = false;
-  }
-  return backendAvailable;
+  return (localStorage.getItem(API_BASE_STORAGE_KEY) || window.PROCESS_GRAPH_API_BASE || "").replace(/\/+$/, "");
 }
 
 function compileWithClarification(message) {
@@ -3462,7 +3113,6 @@ function renderElementConstraints() {
             <span>Constraint</span>
             <textarea data-constraint-field="expression" placeholder="Describe the constraint in plain language…">${escapeHtml(constraint.expression || "")}</textarea>
           </label>
-          ${renderConstraintProjectionSummary(constraint.id)}
           <div class="constraint-meta">
             <button class="icon-button danger" type="button" title="Remove constraint" data-delete-constraint="${escapeAttribute(constraint.id)}">✕</button>
           </div>
@@ -4563,13 +4213,11 @@ function applyMutation(mutation, options = {}) {
     case "update_constraint": {
       const constraint = graph.constraints.find((item) => item.id === mutation.target_id);
       if (!constraint) return;
-      const expressionChanged = Object.prototype.hasOwnProperty.call(payload, "expression") && payload.expression !== constraint.expression;
       Object.assign(constraint, payload);
       // expression is the source of truth (free text); fields kept only for back-compat.
       if (payload.fields) {
         constraint.fields = { ...(constraint.fields || {}), ...payload.fields };
       }
-      if (expressionChanged) markConstraintProjectionStale(mutation.target_id);
       break;
     }
     case "add_assumption": {
@@ -5145,26 +4793,6 @@ function generateMarkdown() {
   lines.push("");
   lines.push("---");
   lines.push("");
-  lines.push("## Optimization Projection");
-  lines.push("");
-  const projection = normalizeOptimizationProjection(graph.optimization_projection);
-  const sourceArtifacts = graph.source_artifacts || [];
-  const artifactRefs = graph.artifact_refs || [];
-  if (!hasPlantRoundTrip(graph)) {
-    lines.push("- None attached");
-  } else {
-    lines.push(`- Target format: ${projection.target_format}`);
-    lines.push(`- Source artifacts: ${sourceArtifacts.length}`);
-    lines.push(`- Artifact refs: ${artifactRefs.length}`);
-    lines.push(`- LP constraints: ${projection.constraints.length}`);
-    const projectionStatuses = countBy(projection.constraints, "status");
-    Object.entries(projectionStatuses).forEach(([status, count]) => lines.push(`- ${status}: ${count}`));
-    const projectionValidation = projection.validation?.errors || projection.validation?.warnings ? projection.validation : validatePlantRoundTrip(graph);
-    lines.push(`- Plant JSON validation: ${projectionValidation.errors?.length || 0} errors, ${projectionValidation.warnings?.length || 0} warnings`);
-  }
-  lines.push("");
-  lines.push("---");
-  lines.push("");
   lines.push("## Graph JSON");
   lines.push("");
   lines.push("```json");
@@ -5223,7 +4851,6 @@ function exportEnvelope() {
     mutation_log: mutationLog,
     open_questions: openQuestions,
     chat_messages: chatMessages,
-    llm_assist_enabled: llmAssistEnabled,
     ontology: graph.ontology,
     assumptions: graph.assumptions,
     versions: graph.versions || [],
@@ -5231,10 +4858,6 @@ function exportEnvelope() {
     // DS-3: the flattened design-space handoff artifact (derived variables +
     // authored objectives/budgets/notes). Computed at export time.
     design_space: buildDesignSpace(graph),
-    optimization_projection: graph.optimization_projection,
-    source_artifacts: graph.source_artifacts,
-    artifact_refs: graph.artifact_refs,
-    plant_validation: validatePlantRoundTrip(graph),
     notation_profile: snakeCaseNotationProfile(currentNotationProfile()),
     validation,
     handoff_readiness: computeHandoffReadiness(),
@@ -5451,15 +5074,11 @@ async function importGraphFromFile(file, options = {}) {
     return false;
   }
 
-    // Accept a full export envelope ({ graph, layout, ... }), canonical Plant JSON
-  // ({ nodes, edges, constraints, objective, timeConfig }), or a bare ProcessGraph.
+  // Accept either a full export envelope ({ graph, layout, ... }) or a bare
+  // graph object ({ nodes, edges, ... }).
   const isEnvelope = parsed && typeof parsed === "object" && parsed.graph && typeof parsed.graph === "object";
-  const env = isEnvelope ? parsed : isPlantJsonArtifact(parsed) ? plantJsonToProcessGraphEnvelope(parsed, file.name) : { graph: parsed };
+  const env = isEnvelope ? parsed : { graph: parsed };
   const importedGraph = env.graph;
-
-  if (env.import_kind === "plant_json") {
-    await persistPlantImportArtifact(importedGraph, parsed, file.name);
-  }
 
   if (!importedGraph || typeof importedGraph !== "object" || (!Array.isArray(importedGraph.nodes) && !Array.isArray(importedGraph.edges))) {
     toast("File does not contain a valid graph");
@@ -5501,15 +5120,14 @@ async function importGraphFromFile(file, options = {}) {
   }
   renderPlan();
   render();
-  const importMessage = env.import_kind === "plant_json" ? "Plant JSON imported as a process map" : "Graph imported";
   if (options.fileHandle) {
     updateCurrentFileHandle(options.fileHandle, file.name);
-    toast(env.import_kind === "plant_json" ? importMessage : `Opened ${currentFileName || file.name || "JSON file"}`);
+    toast(`Opened ${currentFileName || file.name || "JSON file"}`);
   } else if (options.clearFileHandle) {
     clearCurrentFileHandle();
-    toast(importMessage);
+    toast("Graph imported");
   } else {
-    toast(importMessage);
+    toast("Graph imported");
   }
   return true;
 }
@@ -5561,9 +5179,6 @@ function blankGraph() {
     open_questions: [],
     chat_messages: [],
     versions: [],
-    source_artifacts: [],
-    artifact_refs: [],
-    optimization_projection: normalizeOptimizationProjection({}),
     ontology: clone(DEFAULT_ONTOLOGY),
     metadata: { created_by: "user", created_at: new Date().toISOString(), tags: [] },
   };
@@ -5740,757 +5355,6 @@ function normalizeDefinitionStatus(status, description = "") {
   return description ? "custom" : "empty";
 }
 
-// --- Plant JSON round-trip + optimization projection -----------------------
-// Plant JSON is a solver-tool target. The ProcessGraph keeps human-readable
-// constraints as source intent and stores LP/relationship terms as a linked,
-// auditable projection that can be imported, validated, and exported.
-
-const PLANT_VARIABLE_TYPES = ["decision", "exogenous", "endogenous", "parameter", "processParameter", "constant"];
-const PROJECTION_STATUSES = ["imported", "draft", "approved", "stale", "rejected"];
-
-function hasPlantRoundTrip(targetGraph = graph) {
-  const projection = targetGraph?.optimization_projection;
-  return Boolean(
-    (Array.isArray(targetGraph?.source_artifacts) && targetGraph.source_artifacts.some((artifact) => artifact?.format === "plant_json" || artifact?.type === "plant_json")) ||
-      (Array.isArray(targetGraph?.artifact_refs) && targetGraph.artifact_refs.some((ref) => ref?.source_format === "plant_json" || ref?.artifact_type === "plant_json")) ||
-      (projection && ((Array.isArray(projection.constraints) && projection.constraints.length) || projection.objective || projection.time_config || projection.metadata || projection.source_artifact_id))
-  );
-}
-
-function normalizeSourceArtifacts(artifacts) {
-  return (Array.isArray(artifacts) ? artifacts : [])
-    .filter((artifact) => artifact && typeof artifact === "object")
-    .map((artifact, index) => ({
-      id: typeof artifact.id === "string" && artifact.id ? artifact.id : `src_${artifact.format || artifact.type || "artifact"}_${index + 1}`,
-      type: typeof artifact.type === "string" && artifact.type ? artifact.type : artifact.format || "external_json",
-      format: typeof artifact.format === "string" && artifact.format ? artifact.format : artifact.type || "external_json",
-      name: typeof artifact.name === "string" ? artifact.name : artifact.source_file_name || "Imported artifact",
-      source_file_name: typeof artifact.source_file_name === "string" ? artifact.source_file_name : "",
-      imported_at: typeof artifact.imported_at === "string" ? artifact.imported_at : new Date().toISOString(),
-      artifact_id: typeof artifact.artifact_id === "string" ? artifact.artifact_id : "",
-      content_ref: typeof artifact.content_ref === "string" ? artifact.content_ref : "",
-      version_id: typeof artifact.version_id === "string" ? artifact.version_id : "",
-      storage_location: typeof artifact.storage_location === "string" ? artifact.storage_location : "",
-      round_trip_role: typeof artifact.round_trip_role === "string" ? artifact.round_trip_role : "",
-      hash: typeof artifact.hash === "string" ? artifact.hash : "",
-      bytes: Number.isFinite(Number(artifact.bytes)) ? Number(artifact.bytes) : null,
-      content: artifact.content && typeof artifact.content === "object" ? clone(artifact.content) : artifact.content,
-      summary: artifact.summary && typeof artifact.summary === "object" ? clone(artifact.summary) : artifact.summary,
-    }));
-}
-
-function jsonByteSize(value) {
-  try {
-    const json = JSON.stringify(value);
-    if (typeof TextEncoder === "function") return new TextEncoder().encode(json).length;
-    return json.length;
-  } catch {
-    return null;
-  }
-}
-
-function normalizeArtifactRefs(refs, sourceArtifacts = []) {
-  const normalized = (Array.isArray(refs) ? refs : [])
-    .filter((ref) => ref && typeof ref === "object")
-    .map((ref, index) => normalizeArtifactRef(ref, index));
-  const seen = new Set(normalized.map((ref) => ref.id));
-  (Array.isArray(sourceArtifacts) ? sourceArtifacts : []).forEach((artifact, index) => {
-    if (!artifact || typeof artifact !== "object") return;
-    const ref = artifactRefFromSourceArtifact(artifact, index);
-    if (seen.has(ref.id)) return;
-    normalized.push(ref);
-    seen.add(ref.id);
-  });
-  return normalized;
-}
-
-function normalizeArtifactRef(ref, index = 0) {
-  const createdAt = typeof ref.created_at === "string" ? ref.created_at : typeof ref.imported_at === "string" ? ref.imported_at : new Date().toISOString();
-  const artifactType = ref.artifact_type || ref.type || ref.format || "external_json";
-  const sourceFormat = ref.source_format || ref.format || ref.type || artifactType;
-  const id = ref.id || ref.artifact_id || `artifact_ref_${slug(sourceFormat)}_${index + 1}`;
-  return {
-    id,
-    artifact_id: typeof ref.artifact_id === "string" && ref.artifact_id ? ref.artifact_id : id,
-    artifact_type: String(artifactType),
-    source_format: String(sourceFormat),
-    name: typeof ref.name === "string" ? ref.name : typeof ref.source_file_name === "string" ? ref.source_file_name : "Imported artifact",
-    source_file_name: typeof ref.source_file_name === "string" ? ref.source_file_name : "",
-    hash: typeof ref.hash === "string" ? ref.hash : "",
-    bytes: Number.isFinite(Number(ref.bytes)) ? Number(ref.bytes) : null,
-    created_at: createdAt,
-    storage_location: typeof ref.storage_location === "string" ? ref.storage_location : "local_file",
-    round_trip_role: typeof ref.round_trip_role === "string" ? ref.round_trip_role : "source",
-    summary: ref.summary && typeof ref.summary === "object" ? clone(ref.summary) : {},
-  };
-}
-
-function artifactRefFromSourceArtifact(artifact, index = 0) {
-  return normalizeArtifactRef(
-    {
-      id: artifact.id,
-      artifact_id: artifact.id,
-      artifact_type: artifact.type || artifact.format || "external_json",
-      source_format: artifact.format || artifact.type || "external_json",
-      name: artifact.name || artifact.source_file_name || "Imported artifact",
-      source_file_name: artifact.source_file_name || "",
-      created_at: artifact.imported_at,
-      storage_location: "local_file",
-      round_trip_role: "source",
-      bytes: artifact.content === undefined ? null : jsonByteSize(artifact.content),
-      summary: artifact.summary || {},
-    },
-    index
-  );
-}
-function latestPlantSourceArtifact(targetGraph = graph) {
-  const sourceArtifacts = (targetGraph.source_artifacts || [])
-    .slice()
-    .reverse()
-    .filter((artifact) => artifact && (artifact.format === "plant_json" || artifact.type === "plant_json"));
-  for (const artifact of sourceArtifacts) {
-    if (artifact.content && typeof artifact.content === "object") return artifact;
-    const cached = cachedArtifactContent(artifact);
-    if (cached && typeof cached === "object") return { ...artifact, content: cached };
-  }
-  const refs = (targetGraph.artifact_refs || [])
-    .slice()
-    .reverse()
-    .filter((ref) => ref && (ref.source_format === "plant_json" || ref.artifact_type === "plant_json"));
-  for (const ref of refs) {
-    const cached = cachedArtifactContent(ref);
-    if (cached && typeof cached === "object") return { ...ref, type: "plant_json", format: "plant_json", content: cached };
-  }
-  return null;
-}
-
-function normalizeOptimizationProjection(projection) {
-  const source = projection && typeof projection === "object" ? projection : {};
-  return {
-    target_format: typeof source.target_format === "string" && source.target_format ? source.target_format : "plant_json",
-    source_artifact_id: typeof source.source_artifact_id === "string" ? source.source_artifact_id : "",
-    status: PROJECTION_STATUSES.includes(source.status) ? source.status : "draft",
-    time_config: source.time_config && typeof source.time_config === "object" ? clone(source.time_config) : source.timeConfig && typeof source.timeConfig === "object" ? clone(source.timeConfig) : null,
-    metadata: source.metadata && typeof source.metadata === "object" ? clone(source.metadata) : null,
-    constraints: Array.isArray(source.constraints) ? source.constraints.map(normalizeLpConstraintProjection) : [],
-    objective: normalizeProjectionObjective(source.objective),
-    validation: source.validation && typeof source.validation === "object" ? clone(source.validation) : {},
-    notes: typeof source.notes === "string" ? source.notes : "",
-  };
-}
-
-function normalizeProjectionObjective(objective) {
-  if (!objective || typeof objective !== "object") return null;
-  const out = {
-    id: typeof objective.id === "string" ? objective.id : "",
-    type: typeof objective.type === "string" ? objective.type : "",
-    name: typeof objective.name === "string" ? objective.name : "",
-    description: typeof objective.description === "string" ? objective.description : "",
-    sense: ["maximize", "minimize"].includes(objective.sense) ? objective.sense : objective.type === "minimize" ? "minimize" : "maximize",
-    terms: Array.isArray(objective.terms) ? objective.terms.map(normalizeProjectionTerm) : [],
-  };
-  return out;
-}
-
-function normalizeProjectionTerm(term) {
-  const source = term && typeof term === "object" ? term : {};
-  const out = { ...source };
-  if (source.nodeId && !source.node_id) out.node_id = source.nodeId;
-  delete out.nodeId;
-  return out;
-}
-
-function normalizeLpConstraintProjection(constraint) {
-  const source = constraint && typeof constraint === "object" ? constraint : {};
-  const out = {
-    id: typeof source.id === "string" && source.id ? source.id : uniqueId("lp_constraint"),
-    process_constraint_id: typeof source.process_constraint_id === "string" ? source.process_constraint_id : typeof source.processConstraintId === "string" ? source.processConstraintId : "",
-    source_constraint_id: typeof source.source_constraint_id === "string" ? source.source_constraint_id : typeof source.sourceConstraintId === "string" ? source.sourceConstraintId : "",
-    target_format: typeof source.target_format === "string" && source.target_format ? source.target_format : "plant_json_relationships",
-    status: PROJECTION_STATUSES.includes(source.status) ? source.status : "draft",
-    type: typeof source.type === "string" ? source.type : "relationships",
-    name: typeof source.name === "string" ? source.name : "",
-    description: typeof source.description === "string" ? source.description : "",
-    target: typeof source.target === "string" ? source.target : "",
-    property: typeof source.property === "string" ? source.property : "",
-    value: source.value !== undefined ? source.value : 0,
-    unit: typeof source.unit === "string" ? source.unit : "",
-    period: source.period !== undefined ? source.period : null,
-    enabled: source.enabled !== undefined ? Boolean(source.enabled) : true,
-    relationship_equation: typeof source.relationship_equation === "string" ? source.relationship_equation : typeof source.relationshipEquation === "string" ? source.relationshipEquation : "",
-    relationship_terms: Array.isArray(source.relationship_terms)
-      ? source.relationship_terms.map(normalizeProjectionTerm)
-      : Array.isArray(source.relationshipTerms)
-        ? source.relationshipTerms.map(normalizeProjectionTerm)
-        : [],
-    items: Array.isArray(source.items) ? source.items.map((item) => (item && typeof item === "object" ? clone(item) : item)) : [],
-    provenance: source.provenance && typeof source.provenance === "object" ? clone(source.provenance) : {},
-  };
-  return out;
-}
-
-function markConstraintProjectionStale(processConstraintId) {
-  if (!processConstraintId || !graph.optimization_projection?.constraints?.length) return;
-  let touched = false;
-  graph.optimization_projection.constraints.forEach((projection) => {
-    if (projection.process_constraint_id !== processConstraintId) return;
-    if (projection.status !== "stale") {
-      projection.status = "stale";
-      projection.provenance = { ...(projection.provenance || {}), stale_at: new Date().toISOString(), stale_reason: "source_constraint_changed" };
-      touched = true;
-    }
-  });
-  if (touched) graph.optimization_projection.validation = {};
-}
-
-function renderConstraintProjectionSummary(processConstraintId) {
-  const linked = (graph.optimization_projection?.constraints || []).filter((projection) => projection.process_constraint_id === processConstraintId);
-  if (!linked.length) return "";
-  const statuses = dedupe(linked.map((projection) => projection.status || "draft"));
-  const termCount = linked.reduce((sum, projection) => sum + (projection.relationship_terms || []).length, 0);
-  const stale = statuses.includes("stale") ? " Projection is stale after source text changed." : "";
-  return `<div class="type-help projection-summary">LP projection: ${linked.length} relationship${linked.length === 1 ? "" : "s"}, ${termCount} term${termCount === 1 ? "" : "s"}; status ${escapeHtml(statuses.join(", "))}.${escapeHtml(stale)}</div>`;
-}
-
-function latestPlantArtifactRef(targetGraph = graph) {
-  return (targetGraph.artifact_refs || [])
-    .slice()
-    .reverse()
-    .find((ref) => ref && (ref.source_format === "plant_json" || ref.artifact_type === "plant_json"));
-}
-
-async function hydratePlantSourceArtifact(targetGraph = graph) {
-  const existing = latestPlantSourceArtifact(targetGraph);
-  if (existing?.content && typeof existing.content === "object") return existing;
-  const ref = latestPlantArtifactRef(targetGraph) || (targetGraph.source_artifacts || []).find((artifact) => artifact?.content_ref || artifact?.artifact_id);
-  if (!ref) return null;
-  const artifact = await loadGraphArtifact(targetGraph.id || graph.id, ref);
-  if (!artifact?.content || typeof artifact.content !== "object") return null;
-  rememberArtifactContent(artifact.artifact_ref || ref, artifact.content);
-  upsertArtifactRef(targetGraph, artifact.artifact_ref || ref);
-  upsertSourceArtifactRef(targetGraph, artifact.artifact_ref || ref, {
-    type: "plant_json",
-    format: "plant_json",
-    summary: artifact.summary || {},
-  });
-  return latestPlantSourceArtifact(targetGraph);
-}
-
-async function persistPlantImportArtifact(importedGraph, plant, sourceFileName) {
-  const sourceArtifact = (importedGraph.source_artifacts || []).find((artifact) => artifact?.format === "plant_json" || artifact?.type === "plant_json");
-  if (!sourceArtifact) return false;
-  const response = await saveGraphArtifact(importedGraph.id, {
-    artifact_id: sourceArtifact.id,
-    artifact_type: "plant_json",
-    source_format: "plant_json",
-    name: sourceArtifact.name || importedGraph.name || "Imported Plant JSON",
-    source_file_name: sourceFileName || sourceArtifact.source_file_name || "plant.json",
-    round_trip_role: "source",
-    content: plant,
-    summary: sourceArtifact.summary || {},
-    metadata: { graph_id: importedGraph.id, import_kind: "plant_json" },
-    validation: validatePlantGraph(plant),
-  });
-  const artifactRef = response?.artifact_ref;
-  if (!artifactRef) return false;
-  rememberArtifactContent(artifactRef, plant);
-  upsertArtifactRef(importedGraph, artifactRef);
-  upsertSourceArtifactRef(importedGraph, artifactRef, sourceArtifact);
-  importedGraph.optimization_projection = normalizeOptimizationProjection(importedGraph.optimization_projection);
-  importedGraph.optimization_projection.source_artifact_id = artifactRef.artifact_id || artifactRef.id;
-  return true;
-}
-
-async function persistPlantExportArtifact(plant, report) {
-  const artifactId = `export_plant_json_${Date.now()}`;
-  const response = await saveGraphArtifact(graph.id, {
-    artifact_id: artifactId,
-    artifact_type: "plant_json",
-    source_format: "plant_json",
-    name: plant.metadata?.name || graph.name || "Plant JSON export",
-    source_file_name: `${slug(plant.metadata?.name || graph.name) || "plant"}.plant.json`,
-    round_trip_role: "export",
-    content: plant,
-    summary: {
-      node_count: (plant.nodes || []).length,
-      edge_count: (plant.edges || []).length,
-      constraint_count: (plant.constraints || []).length,
-      objective_term_count: (plant.objective?.terms || []).length,
-    },
-    metadata: { graph_id: graph.id, exported_from: "process_mapper" },
-    validation: report,
-  });
-  const artifactRef = response?.artifact_ref;
-  if (!artifactRef) return null;
-  rememberArtifactContent(artifactRef, plant);
-  upsertArtifactRef(graph, artifactRef);
-  upsertSourceArtifactRef(graph, artifactRef, { type: "plant_json", format: "plant_json", round_trip_role: "export" });
-  return artifactRef;
-}
-function isPlantJsonArtifact(candidate) {
-  if (!candidate || typeof candidate !== "object") return false;
-  if (!Array.isArray(candidate.nodes) || !Array.isArray(candidate.edges)) return false;
-  if (candidate.modeling_style || candidate.ontology) return false;
-  return Boolean(
-    candidate.timeConfig ||
-      candidate.objective ||
-      candidate.metadata?.schemaFormat === "unified-object" ||
-      candidate.nodes.some((node) => node?.data?.properties) ||
-      candidate.edges.some((edge) => Object.prototype.hasOwnProperty.call(edge || {}, "source") && Object.prototype.hasOwnProperty.call(edge || {}, "target"))
-  );
-}
-
-function plantJsonToProcessGraphEnvelope(plant, sourceFileName = "plant.json") {
-  const name = plant.metadata?.name || sourceFileName.replace(/\.json$/i, "") || "Imported Plant";
-  const graphId = `pg_${slug(name) || "plant"}`;
-  const plantEdges = Array.isArray(plant.edges) ? plant.edges : [];
-  const nodeIds = new Set((plant.nodes || []).map((node) => node.id));
-  const processNodes = (plant.nodes || []).filter((node) => node && node.id).map((node) => plantNodeToProcessNode(node, plantEdges));
-  const processEdges = plantEdges
-    .filter((edge) => edge && edge.source && edge.target && nodeIds.has(edge.source) && nodeIds.has(edge.target))
-    .map(plantEdgeToProcessEdge);
-  const processConstraints = (plant.constraints || []).map((constraint, index) => plantConstraintToProcessConstraint(constraint, index, nodeIds));
-  const sourceArtifactId = `src_plant_json_${Date.now()}`;
-  const importedAt = new Date().toISOString();
-  const artifactSummary = {
-    node_count: (plant.nodes || []).length,
-    edge_count: (plant.edges || []).length,
-    constraint_count: (plant.constraints || []).length,
-    objective_term_count: (plant.objective?.terms || []).length,
-  };
-  const projectionConstraints = (plant.constraints || []).map((constraint, index) =>
-    plantConstraintToProjection(constraint, processConstraints[index]?.id || "", index)
-  );
-  const importedGraph = {
-    id: graphId,
-    name,
-    version: plant.metadata?.version || "0.1.0",
-    description: plant.metadata?.description || "Imported canonical plant JSON for round-trip process mapping.",
-    modeling_style: "system_flow",
-    nodes: processNodes,
-    edges: processEdges,
-    resources: [],
-    constraints: processConstraints,
-    assumptions: [],
-    open_questions: [],
-    saved_views: [],
-    design_space: { objectives: [], budgets: [], notes: "" },
-    optimization_projection: normalizeOptimizationProjection({
-      target_format: "plant_json",
-      source_artifact_id: sourceArtifactId,
-      status: "imported",
-      time_config: plant.timeConfig || null,
-      metadata: plant.metadata || null,
-      constraints: projectionConstraints,
-      objective: plant.objective || null,
-      validation: validatePlantGraph(plant),
-      notes: "Imported from canonical Plant JSON. Plain-language constraints remain editable; LP terms are preserved as projection records.",
-    }),
-    source_artifacts: normalizeSourceArtifacts([
-      {
-        id: sourceArtifactId,
-        type: "plant_json",
-        format: "plant_json",
-        name,
-        source_file_name: sourceFileName,
-        imported_at: importedAt,
-        summary: artifactSummary,
-        content: plant,
-      },
-    ]),
-    artifact_refs: normalizeArtifactRefs([
-      {
-        id: sourceArtifactId,
-        artifact_id: sourceArtifactId,
-        artifact_type: "plant_json",
-        source_format: "plant_json",
-        name,
-        source_file_name: sourceFileName,
-        created_at: importedAt,
-        storage_location: "local_file",
-        round_trip_role: "source",
-        bytes: jsonByteSize(plant),
-        summary: artifactSummary,
-      },
-    ]),
-    ontology: clone(DEFAULT_ONTOLOGY),
-    metadata: {
-      created_by: "plant_json_import",
-      created_at: new Date().toISOString(),
-      tags: Array.isArray(plant.metadata?.tags) ? plant.metadata.tags.slice() : ["plant_json"],
-      plant_metadata: plant.metadata || {},
-    },
-  };
-  return {
-    graph: importedGraph,
-    layout: plantLayout(plant.nodes || []),
-    selected: processNodes[0] ? { kind: "node", id: processNodes[0].id } : selected,
-    import_kind: "plant_json",
-  };
-}
-
-function plantNodeToProcessNode(node, plantEdges) {
-  const incoming = plantEdges.filter((edge) => edge.target === node.id).map(plantEdgeFlowName).filter(Boolean);
-  const outgoing = plantEdges.filter((edge) => edge.source === node.id).map(plantEdgeFlowName).filter(Boolean);
-  return createNode({
-    id: node.id,
-    name: node.data?.label || node.label || node.id,
-    type: mapPlantNodeType(node),
-    inputs: dedupe(incoming),
-    outputs: dedupe(outgoing),
-    attributes: plantPropertiesToAttributes(node.data?.properties || {}),
-    description: node.data?.description || node.description || `Imported plant node ${node.data?.label || node.id}.`,
-    description_status: "approved",
-    perspectives: [
-      {
-        label: "Plant JSON",
-        text: `type=${node.type || ""}${node.data?.navienType ? `; navien_type=${node.data.navienType}` : ""}`,
-      },
-    ],
-  });
-}
-
-function mapPlantNodeType(node) {
-  const navienType = node.data?.navienType || "";
-  if (navienType === "raw_material") return "source";
-  if (navienType === "product") return "sink";
-  if (node.type === "config") return "resource";
-  return "task";
-}
-
-function plantPropertiesToAttributes(properties) {
-  if (Array.isArray(properties)) {
-    return properties.reduce((out, property) => {
-      if (!property?.name) return out;
-      const { name, ...rest } = property;
-      out[name] = rest;
-      return out;
-    }, {});
-  }
-  return properties && typeof properties === "object" ? clone(properties) : {};
-}
-
-function plantEdgeFlowName(edge) {
-  return edge?.data?.label || edge?.data?.material || edge?.label || edge?.id || "material";
-}
-
-function plantEdgeToProcessEdge(edge) {
-  const flowName = plantEdgeFlowName(edge);
-  return createEdge({
-    id: edge.id,
-    from_node: edge.source,
-    to_node: edge.target,
-    type: "flow",
-    condition: edge.data?.condition || "",
-    properties: edge.data || {},
-    flows: [
-      createFlow({
-        id: `f_${slug(edge.id || flowName)}`,
-        name: flowName,
-        kind: edge.data?.flowType === "material" ? "parts" : inferFlowKind(edge.data?.flowType || flowName),
-        quantity: edge.data?.quantity || "",
-        unit: edge.data?.unit || "",
-      }),
-    ],
-  });
-}
-
-function plantConstraintToProcessConstraint(constraint, index, nodeIds) {
-  const id = constraint?.id || `plant_constraint_${index + 1}`;
-  const expression = constraint?.description || constraint?.name || constraint?.relationshipEquation || constraint?.relationship_equation || "Imported plant relationship constraint.";
-  const target = constraint?.target && nodeIds.has(constraint.target) ? constraint.target : "";
-  return createConstraint({
-    id,
-    type: inferProcessConstraintType(constraint),
-    expression,
-    fields: { target },
-    description: constraint?.relationshipEquation || constraint?.relationship_equation || "",
-    description_status: "approved",
-  });
-}
-
-function inferProcessConstraintType(constraint) {
-  const text = `${constraint?.id || ""} ${constraint?.name || ""} ${constraint?.description || ""} ${constraint?.relationshipEquation || ""}`.toLowerCase();
-  if (/capacity|limit|max|min|rated/.test(text)) return "capability_limit";
-  if (/routing|route|if |when /.test(text)) return "routing_rule";
-  if (/time|period|inventory/.test(text)) return "timing";
-  if (/balance|yield|quality|water|ash|moisture|production|consumption|input|output|flow/.test(text)) return "flow_balance";
-  return "policy_rule";
-}
-
-function plantConstraintToProjection(constraint, processConstraintId, index) {
-  return normalizeLpConstraintProjection({
-    ...(constraint || {}),
-    id: constraint?.id || `lp_constraint_${index + 1}`,
-    process_constraint_id: processConstraintId,
-    source_constraint_id: constraint?.id || "",
-    target_format: "plant_json_relationships",
-    status: "imported",
-    provenance: {
-      source_path: `$.constraints[${index}]`,
-      imported_at: new Date().toISOString(),
-      generated_by: "plant_json_import",
-    },
-  });
-}
-
-function plantLayout(nodes) {
-  return (Array.isArray(nodes) ? nodes : []).reduce((out, node) => {
-    if (node?.id && node.position && typeof node.position === "object") {
-      out[node.id] = { x: Number(node.position.x) || 0, y: Number(node.position.y) || 0 };
-    }
-    return out;
-  }, {});
-}
-
-function buildPlantJsonFromGraph(targetGraph = graph) {
-  const sourceArtifact = latestPlantSourceArtifact(targetGraph);
-  const sourcePlant = sourceArtifact?.content && isPlantJsonArtifact(sourceArtifact.content) ? clone(sourceArtifact.content) : {};
-  const projection = normalizeOptimizationProjection(targetGraph.optimization_projection);
-  const plant = sourcePlant && typeof sourcePlant === "object" ? sourcePlant : {};
-  plant.metadata = buildPlantMetadata(targetGraph, sourcePlant.metadata || {}, projection.metadata);
-  plant.timeConfig = projection.time_config || sourcePlant.timeConfig || defaultPlantTimeConfig();
-  plant.nodes = buildPlantNodes(targetGraph, sourcePlant.nodes || []);
-  plant.edges = buildPlantEdges(targetGraph, sourcePlant.edges || []);
-  plant.constraints = projection.constraints.length
-    ? projection.constraints.map((constraint) => projectionToPlantConstraint(constraint, sourcePlant.constraints || []))
-    : Array.isArray(sourcePlant.constraints)
-      ? clone(sourcePlant.constraints)
-      : [];
-  plant.objective = projection.objective && projection.objective.terms.length
-    ? projectionObjectiveToPlant(projection.objective, sourcePlant.objective)
-    : sourcePlant.objective
-      ? clone(sourcePlant.objective)
-      : { sense: "maximize", terms: [] };
-  return plant;
-}
-
-function buildPlantMetadata(targetGraph, sourceMetadata = {}, projectionMetadata = null) {
-  const metadata = { ...(sourceMetadata || {}), ...(projectionMetadata || {}) };
-  metadata.name = targetGraph.name || metadata.name || targetGraph.id || "Process graph plant";
-  if (targetGraph.description) metadata.description = targetGraph.description;
-  metadata.nodeCount = (targetGraph.nodes || []).length;
-  metadata.schemaFormat = metadata.schemaFormat || "unified-object";
-  metadata.tags = Array.isArray(metadata.tags) ? metadata.tags : Array.isArray(targetGraph.metadata?.tags) ? targetGraph.metadata.tags.slice() : [];
-  return metadata;
-}
-
-function defaultPlantTimeConfig() {
-  return { periods: 1, periodLength: 730, periodLabels: ["Period 1"], totalHorizon: 730 };
-}
-
-function buildPlantNodes(targetGraph, sourceNodes) {
-  const sourceById = new Map((sourceNodes || []).map((node) => [node.id, node]));
-  return (targetGraph.nodes || []).map((node) => {
-    const source = sourceById.get(node.id) || {};
-    const data = { ...(source.data || {}) };
-    data.id = node.id;
-    data.label = node.name || node.id;
-    data.properties = attributesToPlantProperties(node.attributes, source.data?.properties || {});
-    const point = layout[node.id] || source.position || {};
-    return {
-      ...source,
-      id: node.id,
-      type: source.type || processNodeTypeToPlantType(node),
-      position: { x: Number(point.x) || 0, y: Number(point.y) || 0 },
-      data,
-    };
-  });
-}
-
-function processNodeTypeToPlantType(node) {
-  if (node.type === "resource") return "config";
-  if (node.type === "source" || node.type === "sink") return "navien";
-  return "process";
-}
-
-function attributesToPlantProperties(attributes, sourceProperties = {}) {
-  const source = Array.isArray(sourceProperties) ? plantPropertiesToAttributes(sourceProperties) : sourceProperties || {};
-  const out = { ...(source && typeof source === "object" ? clone(source) : {}) };
-  Object.entries(attributes || {}).forEach(([key, value]) => {
-    if (isParameterValue(value)) {
-      const next = { ...(out[key] && typeof out[key] === "object" ? out[key] : {}), ...clone(value) };
-      if (out[key]?.value !== undefined && String(out[key].value) === String(value.value)) next.value = out[key].value;
-      out[key] = next;
-    } else {
-      out[key] = { ...(out[key] && typeof out[key] === "object" ? out[key] : {}), value: String(value ?? ""), type: out[key]?.type || "string" };
-    }
-  });
-  return out;
-}
-
-function buildPlantEdges(targetGraph, sourceEdges) {
-  const sourceById = new Map((sourceEdges || []).map((edge) => [edge.id, edge]));
-  return (targetGraph.edges || []).map((edge) => {
-    const source = sourceById.get(edge.id) || {};
-    const primaryFlow = normalizeFlows(edge.flows)[0] || {};
-    return {
-      ...source,
-      id: edge.id,
-      source: edge.from_node,
-      target: edge.to_node,
-      type: source.type || "custom",
-      data: {
-        ...(source.data || {}),
-        ...(edge.properties || {}),
-        label: source.data?.label || primaryFlow.name || edge.id,
-        flowType: source.data?.flowType || (primaryFlow.kind === "parts" ? "material" : primaryFlow.kind || "material"),
-      },
-    };
-  });
-}
-
-function projectionToPlantConstraint(projection, sourceConstraints) {
-  const source = (sourceConstraints || []).find((constraint) => constraint.id === projection.source_constraint_id || constraint.id === projection.id) || {};
-  const out = { ...clone(source), id: projection.source_constraint_id || projection.id, type: projection.type || "relationships" };
-  if (projection.name) out.name = projection.name;
-  if (projection.description) out.description = projection.description;
-  if (projection.target) out.target = projection.target;
-  if (projection.property) out.property = projection.property;
-  if (projection.value !== undefined) out.value = projection.value;
-  if (projection.unit) out.unit = projection.unit;
-  if (projection.period !== null && projection.period !== undefined) out.period = projection.period;
-  out.enabled = projection.enabled !== false;
-  if (projection.relationship_equation) out.relationshipEquation = projection.relationship_equation;
-  if (projection.relationship_terms) out.relationshipTerms = projection.relationship_terms.map(projectionTermToPlant);
-  if (projection.items?.length) out.items = projection.items.map((item) => (item && typeof item === "object" ? clone(item) : item));
-  return out;
-}
-
-function projectionTermToPlant(term) {
-  const out = { ...clone(term) };
-  if (out.node_id && !out.nodeId) out.nodeId = out.node_id;
-  delete out.node_id;
-  return out;
-}
-
-function projectionObjectiveToPlant(objective, sourceObjective = null) {
-  const source = sourceObjective && typeof sourceObjective === "object" ? clone(sourceObjective) : {};
-  return {
-    ...source,
-    id: objective.id || source.id,
-    type: objective.type || source.type || objective.sense,
-    name: objective.name || source.name,
-    description: objective.description || source.description,
-    sense: objective.sense || source.sense || "maximize",
-    terms: (objective.terms || []).map(projectionTermToPlant),
-  };
-}
-
-function validatePlantRoundTrip(targetGraph = graph) {
-  if (!hasPlantRoundTrip(targetGraph)) return { valid: true, errors: [], warnings: ["No plant_json source or optimization projection is attached."] };
-  const report = validatePlantGraph(buildPlantJsonFromGraph(targetGraph));
-  targetGraph.optimization_projection = normalizeOptimizationProjection(targetGraph.optimization_projection);
-  targetGraph.optimization_projection.validation = report;
-  return report;
-}
-
-function validatePlantGraph(plant) {
-  const errors = [];
-  const warnings = [];
-  const nodes = Array.isArray(plant?.nodes) ? plant.nodes : [];
-  const edges = Array.isArray(plant?.edges) ? plant.edges : [];
-  const constraints = Array.isArray(plant?.constraints) ? plant.constraints : [];
-  const objective = plant?.objective && typeof plant.objective === "object" ? plant.objective : null;
-  if (!nodes.length) errors.push("Plant JSON must include nodes[].");
-  if (!plant?.timeConfig?.periodLength) errors.push("Plant JSON must include timeConfig.periodLength.");
-  if (!objective) errors.push("Plant JSON must include objective.");
-  if (objective && !["maximize", "minimize"].includes(objective.sense)) errors.push("objective.sense must be maximize or minimize.");
-
-  const nodeIds = new Set();
-  const propertyIndex = new Map();
-  let decisionCount = 0;
-  nodes.forEach((node) => {
-    if (!node?.id) {
-      errors.push("Every plant node needs an id.");
-      return;
-    }
-    if (nodeIds.has(node.id)) errors.push(`Duplicate plant node id: ${node.id}`);
-    nodeIds.add(node.id);
-    const props = plantPropertiesToAttributes(node.data?.properties || {});
-    const propNames = new Set(Object.keys(props));
-    propertyIndex.set(node.id, propNames);
-    Object.entries(props).forEach(([propName, prop]) => {
-      const variableType = prop?.variableType;
-      if (variableType && !PLANT_VARIABLE_TYPES.includes(variableType)) {
-        errors.push(`${node.id}.${propName} has unsupported variableType ${variableType}.`);
-      }
-      if (variableType === "decision") decisionCount += 1;
-    });
-  });
-  if (!decisionCount) warnings.push("No decision variables found; this may be a structure-only plant graph.");
-
-  edges.forEach((edge) => {
-    if (!nodeIds.has(edge?.source)) errors.push(`Edge ${edge?.id || "(missing id)"} references missing source ${edge?.source}.`);
-    if (!nodeIds.has(edge?.target)) errors.push(`Edge ${edge?.id || "(missing id)"} references missing target ${edge?.target}.`);
-  });
-
-  constraints.forEach((constraint) => {
-    const terms = Array.isArray(constraint.relationshipTerms) ? constraint.relationshipTerms : Array.isArray(constraint.relationship_terms) ? constraint.relationship_terms : [];
-    terms.forEach((term) => validatePlantReference(term.variable || (term.target && term.property ? `${term.target}.${term.property}` : ""), propertyIndex, errors, `constraint ${constraint.id || "(missing id)"}`));
-    validateCoefficientReferences(constraint.relationshipEquation || constraint.relationship_equation || "", propertyIndex, warnings, `constraint ${constraint.id || "(missing id)"}`);
-  });
-
-  (objective?.terms || []).forEach((term) => {
-    validatePlantReference(term.variable || (term.target && term.property ? `${term.target}.${term.property}` : ""), propertyIndex, errors, `objective term ${term.description || term.variable || "(unnamed)"}`);
-    if (term.coefficient?.path) validatePlantReference(term.coefficient.path, propertyIndex, errors, `objective coefficient ${term.coefficient.path}`);
-    if (term.coefficient?.formula) validateCoefficientReferences(term.coefficient.formula, propertyIndex, warnings, `objective term ${term.variable || "(unnamed)"}`);
-  });
-
-  return { valid: errors.length === 0, errors, warnings };
-}
-
-function validateCoefficientReferences(text, propertyIndex, warnings, context) {
-  if (!text) return;
-  const matches = String(text).matchAll(/\{\{([^}]+)\}\}/g);
-  for (const match of matches) {
-    const ref = match[1];
-    if (ref.startsWith("time-config.")) continue;
-    const missing = plantReferenceMissing(ref, propertyIndex);
-    if (missing) warnings.push(`${context} references ${ref}, but ${missing}.`);
-  }
-}
-
-function validatePlantReference(reference, propertyIndex, errors, context) {
-  if (!reference) return;
-  const missing = plantReferenceMissing(reference, propertyIndex);
-  if (missing) errors.push(`${context} references ${reference}, but ${missing}.`);
-}
-
-function plantReferenceMissing(reference, propertyIndex) {
-  const parts = String(reference).split(".");
-  if (parts.length < 2) return "the reference is not in node.property form";
-  const nodeId = parts.shift();
-  const property = parts.join(".");
-  const props = propertyIndex.get(nodeId);
-  if (!props) return `node ${nodeId} does not exist`;
-  if (props.has(property)) return "";
-  const periodless = property.replace(/_P\d+$/, "");
-  if (periodless !== property && props.has(periodless)) return "";
-  if ([...props].some((name) => name.replace(/_P\d+$/, "") === periodless)) return "";
-  return `property ${property} does not exist on ${nodeId}`;
-}
-
-async function downloadPlantJson() {
-  await hydratePlantSourceArtifact(graph);
-  const plant = buildPlantJsonFromGraph(graph);
-  const report = validatePlantGraph(plant);
-  graph.optimization_projection = normalizeOptimizationProjection(graph.optimization_projection);
-  graph.optimization_projection.validation = report;
-  await persistPlantExportArtifact(plant, report);
-  const json = JSON.stringify(plant, null, 2);
-  const blob = new Blob([json], { type: "application/json;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `${slug(plant.metadata?.name || graph.name) || "plant"}.plant.json`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
-  saveState();
-  toast(report.errors.length ? `Plant JSON exported with ${report.errors.length} validation error${report.errors.length === 1 ? "" : "s"}` : "Plant JSON exported and logged");
-}
 // --- Design-space element annotations (DS-1/5/6/7) -------------------------
 // All additive/optional. A graph without these fields is unchanged.
 
@@ -6522,14 +5386,6 @@ function normalizeParameter(param) {
   if (uncertainty) result.uncertainty = uncertainty;
   const variable = normalizeVariable(source.variable);
   if (variable) result.variable = variable;
-  // Plant JSON properties carry optimizer metadata such as variableType,
-  // displayValue, periodLength, and type. Preserve unknown keys so a graph can
-  // round-trip through the mapper without flattening the solver-facing model.
-  Object.entries(source).forEach(([key, value]) => {
-    if (["value", "unit", "uncertainty", "variable"].includes(key)) return;
-    if (value === undefined) return;
-    result[key] = value && typeof value === "object" ? clone(value) : value;
-  });
   return result;
 }
 
