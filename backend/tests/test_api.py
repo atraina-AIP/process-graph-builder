@@ -155,6 +155,7 @@ def test_healthz_endpoint():
     response = client.get("/healthz")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    assert response.json()["storage"] == "json"
 
 
 def test_session_defaults_to_default_tenant():

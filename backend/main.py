@@ -30,6 +30,10 @@ PRIVATE_GRAPH_DOCUMENT_FIELDS = {"frontend_envelope", "updated_at"}
 LLM_ASSIST_TRUE_VALUES = {"1", "true", "yes", "on"}
 COMPILER_PROMPT_VERSION = "process_graph_compiler_v2"
 DEFAULT_LLM_MODEL = "gpt-5.5"
+STORE_KIND_ENV = "PROCESS_GRAPH_STORE_KIND"
+SQL_CONNECTION_ENV_KEYS = ("AZURE_SQL_CONNECTION_STRING", "SQL_CONNECTION_STRING")
+SQL_GRAPHS_TABLE_ENV = "AZURE_SQL_GRAPHS_TABLE"
+SQL_MUTATION_BATCHES_TABLE_ENV = "AZURE_SQL_MUTATION_BATCHES_TABLE"
 LLM_ASSIST_CLIENT: Any = None
 
 
@@ -294,6 +298,53 @@ def _strip_cosmos_system_fields(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+def get_sql_connection_string() -> str | None:
+    for key in SQL_CONNECTION_ENV_KEYS:
+        value = os.environ.get(key)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _normalize_store_kind(value: str) -> str:
+    normalized = value.strip().lower().replace("-", "_")
+    aliases = {
+        "local": "json",
+        "file": "json",
+        "json_file": "json",
+        "cosmosdb": "cosmos",
+        "cosmos_db": "cosmos",
+        "azure_cosmos": "cosmos",
+        "sql": "azure_sql",
+        "azuresql": "azure_sql",
+        "mssql": "azure_sql",
+        "azure_mssql": "azure_sql",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _sql_table_reference(name: str) -> dict[str, str]:
+    """Return safe object-name forms for a one- or two-part SQL table name."""
+    raw = name.strip()
+    parts = raw.split(".")
+    if len(parts) == 1:
+        schema, table = "dbo", parts[0]
+    elif len(parts) == 2:
+        schema, table = parts
+    else:
+        raise ValueError(f"Invalid Azure SQL table name: {name}")
+
+    identifier = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    if not identifier.match(schema) or not identifier.match(table):
+        raise ValueError(f"Invalid Azure SQL table name: {name}")
+
+    safe_suffix = re.sub(r"[^A-Za-z0-9_]+", "_", f"{schema}_{table}")[:100]
+    return {
+        "object": f"{schema}.{table}",
+        "quoted": f"[{schema}].[{table}]",
+        "safe_suffix": safe_suffix,
+    }
 class GraphStore(Protocol):
     """Storage boundary for graphs and mutation batches.
 
@@ -525,16 +576,321 @@ class CosmosGraphStore:
         }
         self._graphs.upsert_item(document)
 
+class AzureSqlGraphStore:
+    """Azure SQL store for graph documents, frontend envelopes, and mutation audit rows.
+
+    The API remains document-shaped: graph JSON and envelope JSON are stored
+    whole while SQL supplies durable tenant scoping and point reads. This keeps
+    the runtime contract aligned with the JSON and Cosmos stores.
+    """
+
+    def __init__(self) -> None:
+        connection_string = get_sql_connection_string()
+        if not connection_string:
+            raise RuntimeError(
+                "Azure SQL storage requires AZURE_SQL_CONNECTION_STRING or SQL_CONNECTION_STRING."
+            )
+
+        try:
+            import pyodbc
+        except ImportError as exc:
+            raise RuntimeError(
+                "Azure SQL storage requires pyodbc. Install backend/requirements-azure-sql.txt and make sure "
+                "the Microsoft ODBC Driver for SQL Server is available in the runtime image."
+            ) from exc
+
+        self.connection_string = connection_string
+        self._pyodbc = pyodbc
+        self._graphs_table = _sql_table_reference(os.environ.get(SQL_GRAPHS_TABLE_ENV, "process_graphs"))
+        self._batches_table = _sql_table_reference(
+            os.environ.get(SQL_MUTATION_BATCHES_TABLE_ENV, "process_graph_mutation_batches")
+        )
+
+        if env_flag("AZURE_SQL_CREATE_IF_MISSING", True):
+            self._ensure_schema()
+
+    def _connect(self):
+        return self._pyodbc.connect(self.connection_string)
+
+    def _ensure_schema(self) -> None:
+        graphs = self._graphs_table["quoted"]
+        graph_object = self._graphs_table["object"]
+        graph_pk = f"pk_{self._graphs_table['safe_suffix']}"
+        batches = self._batches_table["quoted"]
+        batch_object = self._batches_table["object"]
+        batch_pk = f"pk_{self._batches_table['safe_suffix']}"
+        batch_index = f"ix_{self._batches_table['safe_suffix']}_tenant_graph_created"
+
+        conn = self._connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                IF OBJECT_ID(N'{graph_object}', N'U') IS NULL
+                BEGIN
+                    CREATE TABLE {graphs} (
+                        tenant_id NVARCHAR(128) NOT NULL,
+                        graph_id NVARCHAR(256) NOT NULL,
+                        graph_json NVARCHAR(MAX) NOT NULL,
+                        envelope_json NVARCHAR(MAX) NULL,
+                        created_at DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME(),
+                        updated_at DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME(),
+                        CONSTRAINT [{graph_pk}] PRIMARY KEY (tenant_id, graph_id)
+                    )
+                END
+                ELSE IF COL_LENGTH(N'{graph_object}', N'envelope_json') IS NULL
+                BEGIN
+                    ALTER TABLE {graphs} ADD envelope_json NVARCHAR(MAX) NULL
+                END
+                """
+            )
+            cursor.execute(
+                f"""
+                IF OBJECT_ID(N'{batch_object}', N'U') IS NULL
+                BEGIN
+                    CREATE TABLE {batches} (
+                        tenant_id NVARCHAR(128) NOT NULL,
+                        batch_id NVARCHAR(64) NOT NULL,
+                        graph_id NVARCHAR(256) NOT NULL,
+                        batch_json NVARCHAR(MAX) NOT NULL,
+                        created_at DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME(),
+                        CONSTRAINT [{batch_pk}] PRIMARY KEY (tenant_id, batch_id)
+                    )
+                END
+                """
+            )
+            cursor.execute(
+                f"""
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM sys.indexes
+                    WHERE name = N'{batch_index}'
+                      AND object_id = OBJECT_ID(N'{batch_object}', N'U')
+                )
+                BEGIN
+                    CREATE INDEX [{batch_index}]
+                    ON {batches} (tenant_id, graph_id, created_at DESC)
+                END
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _loads_document(raw: Any) -> dict[str, Any] | None:
+        if raw is None:
+            return None
+        document = json.loads(raw)
+        return document if isinstance(document, dict) else None
+
+    def get_graph(self, tenant_id: str, graph_id: str) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT graph_json
+                FROM {self._graphs_table['quoted']}
+                WHERE tenant_id = ? AND graph_id = ?
+                """,
+                tenant_id,
+                graph_id,
+            )
+            row = cursor.fetchone()
+            graph = self._loads_document(row[0]) if row else None
+        finally:
+            conn.close()
+
+        if graph is None:
+            return None
+        graph["id"] = graph_id
+        graph["tenant_id"] = tenant_id
+        return _strip_cosmos_system_fields(graph)
+
+    def upsert_graph(self, tenant_id: str, graph: dict[str, Any]) -> None:
+        graph = prepare_graph_for_storage(graph, detach_artifact_content=True)
+        graph_id = graph["id"]
+        updated_at = now()
+        document = {**_strip_cosmos_system_fields(graph), "tenant_id": tenant_id, "updated_at": updated_at}
+        graph_json = json.dumps(document, separators=(",", ":"))
+
+        conn = self._connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                UPDATE {self._graphs_table['quoted']}
+                SET graph_json = CAST(? AS NVARCHAR(MAX)),
+                    updated_at = SYSUTCDATETIME()
+                WHERE tenant_id = ? AND graph_id = ?
+                """,
+                graph_json,
+                tenant_id,
+                graph_id,
+            )
+            if cursor.rowcount == 0:
+                cursor.execute(
+                    f"""
+                    INSERT INTO {self._graphs_table['quoted']}
+                        (tenant_id, graph_id, graph_json)
+                    VALUES (?, ?, CAST(? AS NVARCHAR(MAX)))
+                    """,
+                    tenant_id,
+                    graph_id,
+                    graph_json,
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def append_mutation_batch(self, tenant_id: str, batch: dict[str, Any]) -> None:
+        batch_id = uuid.uuid4().hex
+        document = {**batch, "tenant_id": tenant_id, "id": batch_id}
+        graph_id = str(document.get("graph_id") or "")
+        batch_json = json.dumps(document, separators=(",", ":"))
+
+        conn = self._connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                INSERT INTO {self._batches_table['quoted']}
+                    (tenant_id, batch_id, graph_id, batch_json)
+                VALUES (?, ?, ?, CAST(? AS NVARCHAR(MAX)))
+                """,
+                tenant_id,
+                batch_id,
+                graph_id,
+                batch_json,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_graphs(self, tenant_id: str) -> list[dict[str, Any]]:
+        conn = self._connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT graph_json, envelope_json, CONVERT(varchar(33), updated_at, 126)
+                FROM {self._graphs_table['quoted']}
+                WHERE tenant_id = ?
+                """,
+                tenant_id,
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+
+        summaries = []
+        for row in rows:
+            graph = self._loads_document(row[0])
+            if graph is None:
+                continue
+            envelope = self._loads_document(row[1]) if row[1] else None
+            updated_at = (envelope or {}).get("updated_at") or row[2] or graph.get("updated_at", "")
+            summaries.append(graph_summary(_strip_cosmos_system_fields(graph), updated_at=updated_at))
+        return sorted(summaries, key=lambda item: item.get("updated_at", ""), reverse=True)
+
+    def get_envelope(self, tenant_id: str, graph_id: str) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT graph_json, envelope_json
+                FROM {self._graphs_table['quoted']}
+                WHERE tenant_id = ? AND graph_id = ?
+                """,
+                tenant_id,
+                graph_id,
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+
+        if row is None:
+            return None
+        envelope = self._loads_document(row[1]) if row[1] else None
+        if envelope is not None:
+            return envelope
+        graph = self._loads_document(row[0])
+        return {"graph": _strip_cosmos_system_fields(graph)} if graph else None
+
+    def upsert_envelope(self, tenant_id: str, graph_id: str, envelope: dict[str, Any]) -> None:
+        envelope = prepare_envelope_for_storage(envelope, detach_artifact_content=True)
+        graph = envelope.get("graph") if isinstance(envelope.get("graph"), dict) else default_graph(graph_id, tenant_id)
+        updated_at = now()
+        graph = {**_strip_cosmos_system_fields(graph), "id": graph_id, "tenant_id": tenant_id, "updated_at": updated_at}
+        envelope = {**envelope, "graph": _strip_cosmos_system_fields(graph), "updated_at": updated_at}
+        graph_json = json.dumps(graph, separators=(",", ":"))
+        envelope_json = json.dumps(envelope, separators=(",", ":"))
+
+        conn = self._connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                UPDATE {self._graphs_table['quoted']}
+                SET graph_json = CAST(? AS NVARCHAR(MAX)),
+                    envelope_json = CAST(? AS NVARCHAR(MAX)),
+                    updated_at = SYSUTCDATETIME()
+                WHERE tenant_id = ? AND graph_id = ?
+                """,
+                graph_json,
+                envelope_json,
+                tenant_id,
+                graph_id,
+            )
+            if cursor.rowcount == 0:
+                cursor.execute(
+                    f"""
+                    INSERT INTO {self._graphs_table['quoted']}
+                        (tenant_id, graph_id, graph_json, envelope_json)
+                    VALUES (?, ?, CAST(? AS NVARCHAR(MAX)), CAST(? AS NVARCHAR(MAX)))
+                    """,
+                    tenant_id,
+                    graph_id,
+                    graph_json,
+                    envelope_json,
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
 
 def select_store_kind() -> str:
-    """Pick the storage backend from the environment: Cosmos when ``COSMOS_URI``
-    is set, otherwise the local JSON file store."""
-    return "cosmos" if os.environ.get("COSMOS_URI") else "json"
+    """Pick the storage backend from the environment.
+
+    ``PROCESS_GRAPH_STORE_KIND`` may explicitly be ``json``, ``cosmos``, or
+    ``azure_sql``. Without it, existing Cosmos behavior is preserved:
+    ``COSMOS_URI`` selects Cosmos; otherwise a SQL connection string selects
+    Azure SQL; otherwise local JSON is used.
+    """
+    configured = os.environ.get(STORE_KIND_ENV)
+    if configured and configured.strip():
+        kind = _normalize_store_kind(configured)
+        if kind not in {"json", "cosmos", "azure_sql"}:
+            raise ValueError(
+                f"Unsupported {STORE_KIND_ENV}: {configured}. "
+                "Use json, cosmos, or azure_sql."
+            )
+        return kind
+    if os.environ.get("COSMOS_URI"):
+        return "cosmos"
+    if get_sql_connection_string():
+        return "azure_sql"
+    return "json"
 
 
 def create_store() -> GraphStore:
-    if select_store_kind() == "cosmos":
+    store_kind = select_store_kind()
+    if store_kind == "cosmos":
         return CosmosGraphStore()
+    if store_kind == "azure_sql":
+        return AzureSqlGraphStore()
     return JsonFileStore(STORE_PATH)
 
 
@@ -1069,7 +1425,7 @@ app.add_middleware(
 
 @app.get("/healthz", include_in_schema=False)
 def healthz() -> dict[str, str]:
-    return {"status": "ok", "version": VERSION}
+    return {"status": "ok", "version": VERSION, "storage": select_store_kind()}
 
 
 @app.get("/session")

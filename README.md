@@ -92,11 +92,20 @@ Enable App Service Authentication with a Microsoft identity provider when deploy
 
 ### Backend storage
 
-The backend selects its storage layer from the environment:
+The backend selects its storage layer from the environment. Set `PROCESS_GRAPH_STORE_KIND` to force a backend:
 
-- **Local JSON file (default):** used when `COSMOS_URI` is unset. Graphs, saved frontend envelopes, and mutation batches persist to the path in `PROCESS_GRAPH_STORE` (defaults to `backend/data/graphs.json`). Good for single-user dev; no Azure dependency needed at runtime.
-- **Azure Cosmos DB:** used when `COSMOS_URI` is set. The current backend compatibility store keeps graphs and mutation batches in tenant-partitioned NoSQL containers and detaches embedded `source_artifacts.content` before Cosmos writes, leaving lightweight `artifact_refs` on the graph. The property-graph projection is exposed separately through `GET /graph/{id}/property-graph` and can be synced to Cosmos DB for Apache Gremlin with `POST /graph/{id}/property-graph/sync`.
+- `json` - local JSON file
+- `cosmos` - Azure Cosmos DB for NoSQL
+- `azure_sql` - Azure SQL Database
+
+If `PROCESS_GRAPH_STORE_KIND` is unset, the app keeps the existing auto-detect behavior: `COSMOS_URI` selects Cosmos, then an Azure SQL connection string selects Azure SQL, otherwise local JSON is used.
+
+- **Local JSON file (default):** graphs, saved frontend envelopes, and mutation batches persist to the path in `PROCESS_GRAPH_STORE` (defaults to `backend/data/graphs.json`). Good for single-user dev; no Azure dependency needed at runtime.
+- **Azure Cosmos DB for NoSQL:** the current backend compatibility store keeps graphs and mutation batches in tenant-partitioned NoSQL containers and detaches embedded `source_artifacts.content` before Cosmos writes, leaving lightweight `artifact_refs` on the graph. The property-graph projection is exposed separately through `GET /graph/{id}/property-graph` and can be synced to Cosmos DB for Apache Gremlin with `POST /graph/{id}/property-graph/sync`.
+- **Azure SQL Database:** graphs and saved frontend envelopes are stored as canonical JSON documents in `process_graphs`; mutation batches are appended to `process_graph_mutation_batches`. Both tables are keyed by `tenant_id`, and the API contract stays the same document-shaped JSON used by Cosmos.
 - **Artifact ledger:** full imported/exported JSON artifacts, Plant JSON snapshots, and LLM-edited artifact versions are stored outside the live graph. Local dev uses `PROCESS_GRAPH_ARTIFACT_STORE` (defaults to `backend/data/artifacts.json`); the Azure SQL target schema lives in `schema/artifact-ledger.sql`. Graph records point to these rows/files with `artifact_refs` rather than embedding multi-megabyte JSON in Cosmos.
+
+`GET /healthz` returns the selected storage backend in its `storage` field.
 
 Cosmos and artifact environment variables:
 
@@ -116,7 +125,31 @@ Cosmos and artifact environment variables:
 | `COSMOS_GREMLIN_GRAPH` | no | `process_graph` | Gremlin graph collection name |
 | `COSMOS_GREMLIN_KEY` | yes (for live Gremlin writes) | `COSMOS_KEY` | Gremlin account key; dry runs can report target config without a key |
 
+Cosmos must be a Cosmos DB for NoSQL account endpoint such as `https://<account>.documents.azure.com:443/`. A Gremlin endpoint such as `wss://<account>.gremlin.cosmos.azure.com:443/` is not compatible with the NoSQL graph-document adapter.
+
 The Gremlin writer follows the Azure Cosmos DB for Apache Gremlin Python connection shape: `wss://...gremlin.cosmos.azure.com:443/`, username `/dbs/{database}/colls/{graph}`, and GraphSON v2 serialization. It is intentionally lazy: local/test runs use the JSON sync writer unless `COSMOS_GREMLIN_ENDPOINT` or `COSMOS_GREMLIN_HOST` is set.
+
+Azure SQL environment variables:
+
+| Variable | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `AZURE_SQL_CONNECTION_STRING` | yes (to enable SQL) | - | ODBC connection string. `SQL_CONNECTION_STRING` is also accepted as a fallback name. |
+| `AZURE_SQL_CREATE_IF_MISSING` | no | `true` | Create tables/indexes on startup; set `false` if schema is managed separately. |
+| `AZURE_SQL_GRAPHS_TABLE` | no | `process_graphs` | One- or two-part table name for graph documents and saved frontend envelopes. |
+| `AZURE_SQL_MUTATION_BATCHES_TABLE` | no | `process_graph_mutation_batches` | One- or two-part table name for mutation-batch audit records. |
+
+Example Azure SQL connection string:
+
+```text
+Driver={ODBC Driver 18 for SQL Server};Server=tcp:<server>.database.windows.net,1433;Database=<database>;Authentication=ActiveDirectoryMsi;Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;
+```
+
+For local Azure SQL testing, use Python 3.12 and install the optional SQL dependency set:
+
+```powershell
+cd backend
+pip install -r requirements-azure-sql.txt
+```
 
 ### Optional LLM assist
 
@@ -132,6 +165,7 @@ $env:PROCESS_GRAPH_LLM_MODEL = "gpt-5.5"
 Then turn on **LLM assist** in the left chat panel. The browser still previews returned mutations before anything is applied. If the server flag is off, the key/package is missing, or the provider call fails, `/graph/assist` returns the deterministic compiler result with a warning. The request includes the current graph snapshot and recent chat messages so the model does not plan against stale persisted state.
 
 The server prompt includes domain examples for DTA/data-to-action, network/distribution, manufacturing, and plant/structured-MILP authoring. The plant example is intentionally informed by `PLANT-JSON-SCHEMA.md`, `PLANT-PIPELINE.md`, and `norprod.json`, but it avoids treating NOR stage names as the abstraction. It teaches the model to preserve reusable optimization structure: node roles, stable IDs, node-property names, `variableType`, units, `timeConfig`, relationship constraints, and objective hints as graph metadata for future exporters without embedding contracts into plant topology.
+
 
 Run the backend tests with:
 

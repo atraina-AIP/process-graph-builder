@@ -18,8 +18,15 @@ TEST_DATA_DIR.mkdir(exist_ok=True)
 os.environ["PROCESS_GRAPH_STORE"] = str(TEST_DATA_DIR / "graphs-test.json")
 os.environ["PROCESS_GRAPH_ARTIFACT_STORE"] = str(TEST_DATA_DIR / "artifacts-test.json")
 os.environ["PROCESS_GRAPH_PROPERTY_GRAPH_SYNC_STORE"] = str(TEST_DATA_DIR / "property-graph-sync-test.json")
-os.environ.pop("COSMOS_GREMLIN_ENDPOINT", None)
-os.environ.pop("COSMOS_GREMLIN_HOST", None)
+for key in (
+    "PROCESS_GRAPH_STORE_KIND",
+    "COSMOS_URI",
+    "AZURE_SQL_CONNECTION_STRING",
+    "SQL_CONNECTION_STRING",
+    "COSMOS_GREMLIN_ENDPOINT",
+    "COSMOS_GREMLIN_HOST",
+):
+    os.environ.pop(key, None)
 
 import pytest  # noqa: E402
 
